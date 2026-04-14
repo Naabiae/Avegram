@@ -65,7 +65,7 @@ async def cmd_register(u, ctx):
     r = proxy_post("/v1/thirdParty/user/generateWallet", {"assetsName": "user_" + uid, "returnMnemonic": False})
     if r.get("status") not in (200, 0) or not r.get("data"):
         await u.message.reply_text("Registration failed: " + str(r.get("msg", ""))); return
-    d = r["data"][0]
+    d = r["data"]
     users[uid] = {"assets_id": d["assetsId"], "address_list": d.get("addressList", []), "username": u.effective_user.username, "chain": "bsc"}
     save_users(users)
     bsc_addr = next((a["address"] for a in d.get("addressList", []) if a["chain"] == "bsc"), "N/A")
