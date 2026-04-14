@@ -231,7 +231,7 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             aid = users[uid]["assets_id"]
             usdt = "0x55d398326f99059fF775485246999027B3197955"
             
-            qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {"chain": chain, "assetsId": aid, "inTokenAddress": usdt, "outTokenAddress": ta, "inAmount": str(int(amount * 1e6)), "swapType": "buy", "slippage": "1000"})
+            qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {"chain": chain, "assetsId": aid, "inTokenAddress": usdt, "outTokenAddress": ta, "inAmount": str(int(amount * 1e18)), "swapType": "buy", "slippage": "1000"})
             
             if qr.get("status") not in (200, 0):
                 await u.message.reply_text(f"❌ Buy failed: {qr.get('msg', '')}\nTP/SL setup cancelled.", reply_markup=rm)
@@ -648,7 +648,7 @@ async def cmd_trade(u, ctx, is_callback=False):
     usdt = "0x55d398326f99059fF775485246999027B3197955"
     await msg.edit_text("Getting quote for " + str(amount) + " USDT to " + sym + "...")
     
-    qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {"chain": "bsc", "assetsId": aid, "inTokenAddress": usdt, "outTokenAddress": ta, "inAmount": str(int(amount * 1e6)), "swapType": "buy", "slippage": "500"})
+    qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {"chain": "bsc", "assetsId": aid, "inTokenAddress": usdt, "outTokenAddress": ta, "inAmount": str(int(amount * 1e18)), "swapType": "buy", "slippage": "500"})
     if qr.get("status") not in (200, 0):
         await msg.edit_text("Swap failed: " + str(qr.get("msg", "")), reply_markup=rm)
         return
@@ -763,7 +763,7 @@ async def cmd_quote(u, ctx):
     chain = tok_chain
 
     # Get quote - inAmount in smallest unit (USDT has 6 decimals for BSC-USDT, 6 for ETH too)
-    in_amount_smallest = str(int(amount * 1e6))  # 6 decimals for USDT
+    in_amount_smallest = str(int(amount * 1e18))  # 18 decimals for BSC USDT
 
     try:
         qr = proxy_post("/v1/thirdParty/chainWallet/getAmountOut", {
