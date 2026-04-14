@@ -2,8 +2,10 @@
 import os, json, asyncio, sys, urllib.request, urllib.parse, base64, datetime, hmac, hashlib
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from dotenv import load_dotenv
 
 AVENUE_SCRIPTS = "/home/workspace/ave-cloud-skill/scripts"
+load_dotenv("/home/workspace/Avegram/.env")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 AVE_API_KEY = os.environ.get("AVE_API_KEY", "")
 AVE_SECRET_KEY = os.environ.get("AVE_SECRET_KEY", "")
@@ -45,6 +47,7 @@ async def cmd_start(u, ctx):
         "/register - Create your Ave proxy wallet\n"
         "/deposit - View deposit address\n"
         "/balance - Check portfolio\n"
+        "/quote SYMBOL [AMOUNT] - Get price quote\n"
         "/signal - Scan for signals\n"
         "/trade SYMBOL AMOUNT - Execute swap\n"
         "/topwallets - Smart money wallets\n"
@@ -244,12 +247,113 @@ async def cmd_track(u, ctx):
     else: lines.append("No holdings found")
     await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-async def cmd_help(u, ctx): await u.message.reply_text("/register /deposit /balance /signal /trade SYM AMOUNT /topwallets [chain] /track ADDRESS /help", parse_mode="Markdown")
+async def cmd_help(u, ctx): await u.message.reply_text(
+    "/register /deposit /balance /quote SYM [AMT] /signal /trade SYM AMT /topwallets [chain] /track ADDRESS /help\n\n"
+    "ENV Status:\n"
+    f"TELEGRAM_BOT_TOKEN: {'✅ set' if BOT_TOKEN else '❌ missing'}\n"
+    f"AVE_API_KEY: {'✅ set' if AVE_API_KEY else '❌ missing'}\n"
+    f"AVE_SECRET_KEY: {'✅ set' if AVE_SECRET_KEY else '❌ missing'}\n"
+    f"API_PLAN: {API_PLAN or 'pro'}\n\n"
+    "Powered by Ave Cloud API",
+    parse_mode="Markdown"
+)
+
+async def cmd_quote(u, ctx):
+    """Quote price for a token - shows estimated output for a given input amount"""
+    if not ctx.args:
+        await u.message.reply_text("Usage: /quote SYMBOL [AMOUNT]\nExample: /quote ASTER 10\nShows quote for converting 10 USDT to ASTER")
+        return
+
+    sym = ctx.args[0].upper()
+    amount = float(ctx.args[1]) if len(ctx.args) > 1 else 10.0  # default 10 USDT
+
+    await u.message.reply_text(f"Getting quote for {amount} USDT → {sym}...")
+
+    # Find token address
+    sys.path.insert(0, AVENUE_SCRIPTS)
+    from ave.http import api_get
+
+    sr = await api_get("/tokens", {"keyword": sym, "limit": 5, "chain": "bsc"})
+    tok_data = sr.json().get("data", [])
+    if not tok_data:
+        # Try ETH chain
+        sr = await api_get("/tokens", {"keyword": sym, "limit": 5, "chain": "eth"})
+        tok_data = sr.json().get("data", [])
+
+    if not tok_data:
+        await u.message.reply_text(f"Token '{sym}' not found on BSC or ETH.")
+        return
+
+    # Find token with matching symbol
+    ta = None
+    tok_chain = "bsc"
+    for t in tok_data:
+        if t.get("symbol", "").upper() == sym.upper():
+            ta = t.get("token", "").split("-")[0]
+            tok_chain = t.get("chain", "bsc")
+            break
+    if not ta:
+        ta = tok_data[0].get("token", "").split("-")[0]
+        tok_chain = tok_data[0].get("chain", "bsc")
+
+    # USDT address on BSC
+    usdt_addr = "0x55d398326f99059fF775485246999027B3197955"
+    # USDT on ETH
+    usdt_addr_eth = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+
+    in_token = usdt_addr_eth if tok_chain == "eth" else usdt_addr
+    chain = tok_chain
+
+    # Get quote - inAmount in smallest unit (USDT has 6 decimals for BSC-USDT, 6 for ETH too)
+    in_amount_smallest = str(int(amount * 1e6))  # 6 decimals for USDT
+
+    try:
+        qr = proxy_post("/v1/thirdParty/chainWallet/getAmountOut", {
+            "chain": chain,
+            "inAmount": in_amount_smallest,
+            "inTokenAddress": in_token,
+            "outTokenAddress": ta,
+            "swapType": "buy"
+        })
+    except Exception as e:
+        await u.message.reply_text(f"Quote request failed: {e}")
+        return
+
+    if qr.get("status") not in (200, 0) or not qr.get("data"):
+        await u.message.reply_text(f"Quote failed: {qr.get('msg', 'Unknown error')}")
+        return
+
+    d = qr["data"]
+    estimate_out = int(d.get("estimateOut", 0))
+    decimals = d.get("decimals", 18)
+    spender = d.get("spender", "N/A")
+
+    # Convert to human readable
+    token_amount = estimate_out / (10 ** decimals)
+    price_usd = amount / token_amount if token_amount > 0 else 0
+
+    lines = [
+        f"💱 Quote: {amount} USDT → {sym}",
+        f"Chain: {chain.upper()}",
+        f"Estimated {sym} out: {token_amount:,.6f}",
+        f"Price: ${price_usd:,.6f} per {sym}",
+        f"Token: `{ta}`",
+        f"Spender: `{spender[:20]}...`" if len(spender) > 20 else f"Spender: `{spender}`",
+        "",
+        f"Link: https://pro.ave.ai/token/{ta}-{chain}"
+    ]
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 
 def main():
     if not BOT_TOKEN: print("ERROR: TELEGRAM_BOT_TOKEN not set"); return
     app = Application.builder().token(BOT_TOKEN).build()
-    for cmd, fn in [("start", cmd_start), ("register", cmd_register), ("deposit", cmd_deposit), ("balance", cmd_balance), ("signal", cmd_signal), ("trade", cmd_trade), ("topwallets", cmd_topwallets), ("track", cmd_track), ("help", cmd_help)]:
+    for cmd, fn in [
+        ("start", cmd_start), ("register", cmd_register), ("deposit", cmd_deposit),
+        ("balance", cmd_balance), ("quote", cmd_quote), ("signal", cmd_signal),
+        ("trade", cmd_trade), ("topwallets", cmd_topwallets), ("track", cmd_track),
+        ("help", cmd_help)
+    ]:
         app.add_handler(CommandHandler(cmd, fn))
     print("Avegram v2 running on proxy wallet mode...")
     app.run_polling()
