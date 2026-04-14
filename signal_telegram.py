@@ -11,6 +11,7 @@ AVE_API_KEY = os.environ.get("AVE_API_KEY", "")
 AVE_SECRET_KEY = os.environ.get("AVE_SECRET_KEY", "")
 API_PLAN = os.environ.get("API_PLAN", "pro")
 USERS_FILE = "/home/workspace/Avegram/users.json"
+TRADES_FILE = "/home/workspace/Avegram/trades.json"
 
 def load_users():
     if os.path.exists(USERS_FILE):
@@ -19,6 +20,14 @@ def load_users():
 
 def save_users(u):
     with open(USERS_FILE, "w") as f: json.dump(u, f, indent=2)
+
+def load_trades():
+    if os.path.exists(TRADES_FILE):
+        with open(TRADES_FILE) as f: return json.load(f)
+    return {}
+
+def save_trades(t):
+    with open(TRADES_FILE, "w") as f: json.dump(t, f, indent=2)
 
 def proxy_headers(method, path, body=None):
     import base64, datetime, hashlib, hmac
@@ -101,6 +110,20 @@ async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_users(users)
         keyboard = [[InlineKeyboardButton("🔙 Cancel", callback_data="cb_menu")]]
         await query.message.edit_text("💱 *Trade Token*\n\nPlease enter the SYMBOL and AMOUNT separated by space.\nExample: `PEPE 10` (to buy $10 worth of PEPE)", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    elif data.startswith("auto_"):
+        parts = data.split("_")
+        if len(parts) >= 5:
+            chain = parts[1]
+            addr_short = parts[2]
+            sym = parts[3]
+            price = parts[4]
+            users = load_users()
+            uid_str = str(uid)
+            users[uid_str]["state"] = "awaiting_auto_trade_amount"
+            users[uid_str]["auto_trade"] = {"chain": chain, "sym": sym, "price": price, "addr_short": addr_short}
+            save_users(users)
+            keyboard = [[InlineKeyboardButton("🔙 Cancel", callback_data="cb_menu")]]
+            await query.message.edit_text(f"⚡ *Auto-Trade {sym}*\n\nEnter amount of USDT to invest:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(u.effective_user.id)
@@ -142,6 +165,183 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             def __init__(self, args):
                 self.args = args
         await cmd_trade(u, MockCtx(parts), is_callback=False)
+
+    elif state == "awaiting_auto_trade_amount":
+        try:
+            amount = float(text)
+            users[uid]["auto_trade"]["amount"] = amount
+            users[uid]["state"] = "awaiting_auto_trade_tp"
+            save_users(users)
+            sym = users[uid]["auto_trade"]["sym"]
+            await u.message.reply_text(f"Amount: ${amount}\n\nEnter Take-Profit % for {sym} (e.g. 50):", reply_markup=rm)
+        except ValueError:
+            await u.message.reply_text("Invalid amount. Please try again.", reply_markup=rm)
+
+    elif state == "awaiting_auto_trade_tp":
+        try:
+            tp = float(text)
+            users[uid]["auto_trade"]["tp_pct"] = tp
+            users[uid]["state"] = "awaiting_auto_trade_sl"
+            save_users(users)
+            sym = users[uid]["auto_trade"]["sym"]
+            await u.message.reply_text(f"Take-Profit: +{tp}%\n\nEnter Stop-Loss % for {sym} (e.g. -20):", reply_markup=rm)
+        except ValueError:
+            await u.message.reply_text("Invalid percentage. Please try again.", reply_markup=rm)
+
+    elif state == "awaiting_auto_trade_sl":
+        try:
+            sl = float(text)
+            users[uid]["auto_trade"]["sl_pct"] = sl
+            users[uid]["state"] = None
+            save_users(users)
+            
+            auto_cfg = users[uid]["auto_trade"]
+            sym = auto_cfg["sym"]
+            amount = auto_cfg["amount"]
+            chain = auto_cfg["chain"]
+            
+            await u.message.reply_text(f"⏳ Setting up TP/SL for {sym}...\nExecuting initial buy of ${amount}...", reply_markup=rm)
+            
+            # Execute BUY order
+            sys.path.insert(0, AVENUE_SCRIPTS); from ave.http import api_get
+            sr = await api_get("/tokens", {"keyword": sym, "limit": 5, "chain": chain})
+            tok_data = sr.json().get("data", [])
+            if not tok_data:
+                await u.message.reply_text(f"Token {sym} not found. Auto-trade cancelled.", reply_markup=rm)
+                return
+                
+            ta = tok_data[0].get("token", "").split("-")[0]
+            aid = users[uid]["assets_id"]
+            usdt = "0x55d398326f99059fF775485246999027B3197955"
+            
+            qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {"chain": chain, "assetsId": aid, "inTokenAddress": usdt, "outTokenAddress": ta, "inAmount": str(int(amount * 1e6)), "swapType": "buy", "slippage": "1000"})
+            
+            if qr.get("status") not in (200, 0):
+                await u.message.reply_text(f"❌ Buy failed: {qr.get('msg', '')}\nTP/SL setup cancelled.", reply_markup=rm)
+                return
+                
+            oid = ""
+            d = qr.get("data", {})
+            if isinstance(d, dict): oid = d.get("id", "")
+            elif isinstance(d, list) and d: oid = d[0].get("id", "") if isinstance(d[0], dict) else str(d[0])
+            
+            # Save to trades.json
+            trades = load_trades()
+            if uid not in trades:
+                trades[uid] = {}
+                
+            # Get actual current price for entry
+            pr = await api_get(f"/tokens/{ta}-{chain}")
+            entry_price = float(auto_cfg["price"])
+            if pr.status_code == 200 and pr.json().get("data"):
+                entry_price = float(pr.json()["data"].get("token", {}).get("current_price_usd", entry_price))
+                
+            trades[uid][ta] = {
+                "chain": chain,
+                "symbol": sym,
+                "entry_price": entry_price,
+                "invested_usdt": amount,
+                "tp_pct": auto_cfg["tp_pct"],
+                "sl_pct": auto_cfg["sl_pct"],
+                "status": "active"
+            }
+            save_trades(trades)
+            
+            await u.message.reply_text(
+                f"✅ **Buy submitted!** Order ID: `{oid}`\n\n"
+                f"🛡️ **TP/SL Configured for {sym}:**\n"
+                f"Entry: ${entry_price:.6f}\n"
+                f"Take-Profit: +{auto_cfg['tp_pct']}%\n"
+                f"Stop-Loss: {auto_cfg['sl_pct']}%\n\n"
+                f"The bot will automatically sell if limits are hit.", 
+                reply_markup=rm, parse_mode="Markdown"
+            )
+            
+        except ValueError:
+            await u.message.reply_text("Invalid percentage. Please try again.", reply_markup=rm)
+
+async def monitor_tp_sl(app: Application):
+    """Background task to monitor prices and trigger TP/SL."""
+    sys.path.insert(0, AVENUE_SCRIPTS); from ave.http import api_get
+    usdt_addr = "0x55d398326f99059fF775485246999027B3197955"
+    
+    while True:
+        try:
+            trades = load_trades()
+            users = load_users()
+            changed = False
+            
+            for uid, user_trades in list(trades.items()):
+                if uid not in users or not users[uid].get("assets_id"):
+                    continue
+                aid = users[uid]["assets_id"]
+                
+                for ta, t in list(user_trades.items()):
+                    if t.get("status") != "active": continue
+                    
+                    chain = t.get("chain", "bsc")
+                    sym = t.get("symbol", "?")
+                    entry = t.get("entry_price", 0)
+                    if entry == 0: continue
+                    
+                    # Fetch current price
+                    pr = await api_get(f"/tokens/{ta}-{chain}")
+                    if pr.status_code != 200 or not pr.json().get("data"):
+                        continue
+                        
+                    curr_price = float(pr.json()["data"].get("token", {}).get("current_price_usd", 0))
+                    if curr_price == 0: continue
+                    
+                    tp_target = entry * (1 + (t["tp_pct"] / 100))
+                    sl_target = entry * (1 + (t["sl_pct"] / 100))
+                    
+                    hit_type = None
+                    if curr_price >= tp_target: hit_type = "Take-Profit"
+                    elif curr_price <= sl_target: hit_type = "Stop-Loss"
+                    
+                    if hit_type:
+                        # 1. Fetch current token balance
+                        r = proxy_get("/v1/thirdParty/tx/getSwapOrder", {"chain": chain, "assetsId": aid, "pageSize": "50", "pageNO": "0"})
+                        bal = 0.0
+                        if r.get("status") in (200, 0) and r.get("data"):
+                            for o in r["data"]:
+                                if o.get("status") != "confirmed": continue
+                                if o.get("outTokenAddress") == ta: bal += float(o.get("outAmount", "0")) / 1e18
+                                elif o.get("inTokenAddress") == ta: bal -= float(o.get("inAmount", "0")) / 1e18
+                        
+                        if bal <= 0.0001:
+                            # User already sold manually
+                            del trades[uid][ta]
+                            changed = True
+                            continue
+                            
+                        # 2. Execute SELL order
+                        in_amount_wei = str(int(bal * 1e18)) # Assuming 18 decimals, proxy_post will handle exact if needed but we send max wei
+                        qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {
+                            "chain": chain, "assetsId": aid, "inTokenAddress": ta, "outTokenAddress": usdt_addr, 
+                            "inAmount": in_amount_wei, "swapType": "sell", "slippage": "1500"
+                        })
+                        
+                        if qr.get("status") in (200, 0):
+                            # Sell successful
+                            pnl_pct = ((curr_price - entry) / entry) * 100
+                            usd_out = bal * curr_price
+                            msg = f"🚨 **{hit_type} Hit!**\n\nSold {round(bal, 4)} {sym} for ~${usd_out:.2f}\nPNL: {pnl_pct:+.2f}%\nPrice: ${curr_price:.6f}"
+                            await app.bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
+                            del trades[uid][ta]
+                            changed = True
+                        else:
+                            # Failed to sell
+                            print(f"TP/SL Sell failed for {uid} {sym}: {qr}")
+                            
+            if changed:
+                save_trades(trades)
+                
+        except Exception as e:
+            print(f"TP/SL Monitor error: {e}")
+            
+        await asyncio.sleep(30)
+
 
 async def cmd_start(u, ctx):
     await show_main_menu(u.message, u.effective_user.id)
@@ -266,6 +466,9 @@ async def cmd_balance(u, ctx, is_callback=False):
     total_invested = 0.0
     total_current = 0.0
     
+    trades = load_trades()
+    user_trades = trades.get(uid, {})
+    
     for sym, p in positions.items():
         if p["bal"] < 0.0001: continue
         total_invested += p["invested"]
@@ -285,6 +488,11 @@ async def cmd_balance(u, ctx, is_callback=False):
         lines.append(f"*{sym}*: {round(p['bal'], 4)}")
         lines.append(f"  Val: ${curr_value:.2f} | Inv: ${p['invested']:.2f}")
         lines.append(f"  PNL: {sign}${abs(pnl_usd):.2f} ({pnl_pct:+.2f}%)")
+        
+        if p['addr'] in user_trades and user_trades[p['addr']].get('status') == 'active':
+            t = user_trades[p['addr']]
+            lines.append(f"  ⚡ TP: +{t['tp_pct']}% | SL: {t['sl_pct']}%")
+            
         lines.append("")
         
     if total_invested == 0 and total_current == 0:
@@ -368,11 +576,22 @@ async def cmd_signal(u, ctx, is_callback=False):
         await msg.edit_text("No signals above 60% confidence right now. Try again later.", reply_markup=rm)
         return
     lines = [f"🔔 {len(signals)} Signals Found (≥60% confidence)\n"]
+    buttons = []
     for s in signals[:8]:
         d = "🟢 BUY" if s["chg"] < -3 else "🔴 SELL" if s["chg"] > 5 else "🟡 WATCH"
         lines.append(f"{d} [{s['conf']}%] {s['sym']} | ${round(s['price'], 8)} | 24h:{round(s['chg'],1)}% | Liq:${s['liq']:,.0f}")
-    lines.append("\n`/trade <sym> <amt>` to execute")
-    await msg.edit_text("\n".join(lines), reply_markup=rm, parse_mode="Markdown")
+        # Note: callback_data max len is 64 bytes. 
+        # auto_trade_<chain>_<addr>_<sym>_<price>
+        cb_data = f"auto_{s['chain']}_{s['addr'][:10]}_{s['sym']}_{round(s['price'],8)}"
+        buttons.append([InlineKeyboardButton(f"⚡ Auto-Trade {s['sym']} (TP/SL)", callback_data=cb_data)])
+        
+    lines.append("\n`/trade <sym> <amt>` to execute manually")
+    
+    # Add back to menu button at the end
+    buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="cb_menu")])
+    new_rm = InlineKeyboardMarkup(buttons)
+    
+    await msg.edit_text("\n".join(lines), reply_markup=new_rm, parse_mode="Markdown")
 
 async def cmd_trade(u, ctx, is_callback=False):
     users = load_users()
@@ -580,6 +799,14 @@ def main():
     
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Start TP/SL background monitor
+    import asyncio
+    
+    async def run_tasks():
+        asyncio.create_task(monitor_tp_sl(app))
+    
+    app.post_init = lambda a: run_tasks()
     
     print("Avegram v2 running on proxy wallet mode...")
     app.run_polling()
