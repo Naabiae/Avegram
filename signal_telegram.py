@@ -5,6 +5,10 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from dotenv import load_dotenv
 
 AVENUE_SCRIPTS = "/home/workspace/ave-cloud-skill/scripts"
+# Try using relative path for the workspace if absolute path doesn't exist
+if not os.path.exists(AVENUE_SCRIPTS):
+    AVENUE_SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ave-cloud-skill", "scripts")
+sys.path.insert(0, AVENUE_SCRIPTS)
 load_dotenv("/home/workspace/Avegram/.env")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 AVE_API_KEY = os.environ.get("AVE_API_KEY", "")
@@ -203,7 +207,7 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text(f"⏳ Setting up TP/SL for {sym}...\nExecuting initial buy of ${amount}...", reply_markup=rm)
             
             # Execute BUY order
-            sys.path.insert(0, AVENUE_SCRIPTS); from ave.http import api_get
+            from ave.http import api_get
             sr = await api_get("/tokens", {"keyword": sym, "limit": 5, "chain": chain})
             tok_data = sr.json().get("data", [])
             if not tok_data:
@@ -262,7 +266,7 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def monitor_tp_sl(app: Application):
     """Background task to monitor prices and trigger TP/SL."""
-    sys.path.insert(0, AVENUE_SCRIPTS); from ave.http import api_get
+    from ave.http import api_get
     usdt_addr = "0x55d398326f99059fF775485246999027B3197955"
     
     while True:
@@ -459,9 +463,9 @@ async def cmd_balance(u, ctx, is_callback=False):
                 positions[sym]["bal"] -= bal_chg
                 positions[sym]["invested"] -= usd_received
                 if positions[sym]["invested"] < 0: positions[sym]["invested"] = 0
-                
-    sys.path.insert(0, AVENUE_SCRIPTS); from ave.http import api_get
-    
+
+    from ave.http import api_get
+
     lines = ["📊 *Portfolio & PNL - BSC*\n"]
     total_invested = 0.0
     total_current = 0.0
@@ -521,6 +525,7 @@ async def cmd_signal(u, ctx, is_callback=False):
     seen = set()
     # 1. Public signals (Ave-filtered, multi-chain)
     try:
+        from ave.http import api_get
         for chain in ["bsc", "solana"]:
             url = f"https://data.ave-api.xyz/v2/signals/public/list?chain={chain}&pageSize=20&pageNO=1"
             req = urllib.request.Request(url, headers={"X-API-KEY": AVE_API_KEY})
@@ -614,7 +619,7 @@ async def cmd_trade(u, ctx, is_callback=False):
         
     sym = ctx.args[0].upper()
     amount = float(ctx.args[1])
-    sys.path.insert(0, AVENUE_SCRIPTS); from ave.http import api_get
+    from ave.http import api_get
     
     if is_callback: await msg.edit_text(f"Looking up {sym}...")
     else: msg = await msg.reply_text(f"Looking up {sym}...")
@@ -646,7 +651,7 @@ async def cmd_topwallets(u, ctx, is_callback=False):
     msg = u.callback_query.message if is_callback else u.message
     kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="cb_menu")]]
     rm = InlineKeyboardMarkup(kb)
-    sys.path.insert(0, AVENUE_SCRIPTS); from ave.http import api_get
+    from ave.http import api_get
     chain = "bsc"
     if ctx.args and ctx.args[0].lower() in ("bsc", "eth", "base", "solana"): chain = ctx.args[0].lower()
     
@@ -667,7 +672,7 @@ async def cmd_topwallets(u, ctx, is_callback=False):
     await msg.edit_text("\n".join(lines), reply_markup=rm, parse_mode="Markdown")
 
 async def cmd_track(u, ctx):
-    sys.path.insert(0, AVENUE_SCRIPTS); from ave.http import api_get
+    from ave.http import api_get
     if not ctx.args: await u.message.reply_text("Usage: /track ADDRESS [chain]"); return
     addr = ctx.args[0]; chain = "bsc"
     if len(ctx.args) > 1 and ctx.args[1].lower() in ("bsc", "eth", "solana"): chain = ctx.args[1].lower()
@@ -711,7 +716,6 @@ async def cmd_quote(u, ctx):
     await u.message.reply_text(f"Getting quote for {amount} USDT → {sym}...")
 
     # Find token address
-    sys.path.insert(0, AVENUE_SCRIPTS)
     from ave.http import api_get
 
     sr = await api_get("/tokens", {"keyword": sym, "limit": 5, "chain": "bsc"})
