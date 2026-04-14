@@ -377,7 +377,6 @@ async def cmd_chain(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Already on {new_chain.upper()}")
         return
 
-    # Generate new wallet for new chain
     wallet = generate_wallet()
     users[uid]["address"] = wallet["address"]
     users[uid]["private_key"] = wallet["private_key"]
@@ -396,6 +395,149 @@ async def cmd_chain(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⚠️ Your previous BSC wallet is still active but not used.",
         parse_mode="Markdown"
     )
+
+async def cmd_topwallets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show top performing smart money wallets"""
+    import sys
+    sys.path.insert(0, AVENUE_SCRIPTS)
+    from ave.http import api_get
+
+    chain = "bsc"
+    if ctx.args:
+        chain = ctx.args[0].lower()
+        if chain not in ("bsc", "eth", "base", "solana"):
+            chain = "bsc"
+
+    await update.message.reply_text(f"🦊 Loading top wallets on {chain.upper()}...")
+
+    params = {
+        "chain": chain,
+        "sort": "profit_above_900_percent_num",
+        "sort_dir": "desc",
+        "profit_900_percent_num_min": 1,
+        "profit_300_900_percent_num_min": 3,
+    }
+    resp = await api_get("/address/smart_wallet/list", params)
+    data = resp.json()
+
+    if data.get("status") != 1 or not data.get("data"):
+        await update.message.reply_text(f"No smart wallets found on {chain.upper()} right now.")
+        return
+
+    wallets = data["data"][:10]
+    lines = [f"🦊 *Top Smart Money Wallets — {chain.upper()}*\n"]
+    lines.append("_(Wallets with 300%+ profitable trades)_\n")
+
+    for i, w in enumerate(wallets, 1):
+        addr = w.get("wallet_address", "")[:10] + "..."
+        p900 = w.get("profit_above_900_percent_num", 0)
+        p300 = w.get("profit_300_900_percent_num", 0)
+        total_profit = float(w.get("total_profit", 0) or 0)
+        last = w.get("last_trade_time", "N/A")
+        if isinstance(last, (int, float)) and last > 0:
+            import datetime
+            last = datetime.datetime.fromtimestamp(last).strftime("%m/%d")
+        lines.append(
+            f"\n{i}. `{addr}`\n"
+            f"   900%+ trades: {p900} | 300-900%: {p300}\n"
+            f"   Total profit: ${total_profit:,.2f}\n"
+            f"   Last active: {last}"
+        )
+        lines.append(f"   🔗 /track {w.get('wallet_address', '')}")
+
+    lines.append("\n\n_Reply /track <address> to see what they're holding._")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Track a specific wallet — shows holdings + recent trades"""
+    import sys
+    sys.path.insert(0, AVENUE_SCRIPTS)
+    from ave.http import api_get
+
+    if not ctx.args:
+        uid = str(update.effective_user.id)
+        users = load_users()
+        if uid in users and users[uid].get("address"):
+            addr = users[uid]["address"]
+        else:
+            await update.message.reply_text(
+                "Usage: /track <address>\nExample: /track 0x... or reply with your own wallet"
+            )
+            return
+    else:
+        addr = ctx.args[0]
+
+    chain = "bsc"
+    if len(ctx.args) > 1:
+        c = ctx.args[1].lower()
+        if c in ("bsc", "eth", "solana"):
+            chain = c
+
+    await update.message.reply_text(f"🔍 Tracking `{addr[:10]}...` on {chain.upper()}...")
+
+    # Get wallet token holdings
+    resp = await api_get("/address/walletinfo/tokens", {
+        "wallet_address": addr,
+        "chain": chain,
+        "sort": "balance_usd",
+        "sort_dir": "desc",
+        "pageSize": 10
+    })
+    data = resp.json()
+
+    lines = [f"📊 *Wallet Portfolio — {chain.upper()}*\n`{addr[:20]}...`\n"]
+
+    if data.get("status") == 1 and data.get("data"):
+        holdings = []
+        for tok in data["data"]:
+            bal = float(tok.get("balance_amount", 0) or 0)
+            if bal <= 0:
+                continue
+            symbol = tok.get("symbol", "?")
+            usd = float(tok.get("balance_usd", 0) or 0)
+            profit_pct = float(tok.get("profit_pct", 0) or 0)
+            holding_profit = "🟢" if profit_pct > 0 else "🔴"
+            holdings.append(
+                f"{holding_profit} {symbol}: {bal:.4f} (${usd:.2f}) | "
+                f"P/L: {profit_pct:+.1f}%"
+            )
+        if holdings:
+            lines.append("📦 *Top Holdings:*")
+            for h in holdings[:5]:
+                lines.append(h)
+        else:
+            lines.append("No token holdings found.")
+    else:
+        lines.append("No holdings data available.")
+
+    # Get recent transactions
+    tx_resp = await api_get("/address/tx", {
+        "wallet_address": addr,
+        "chain": chain,
+        "page_size": 5
+    })
+    tx_data = tx_resp.json()
+
+    if tx_data.get("status") == 1 and tx_data.get("data"):
+        txs = tx_data["data"] if isinstance(tx_data["data"], list) else []
+        if txs:
+            lines.append("\n📜 *Recent Transactions:*")
+            for tx in txs[:5]:
+                blk = str(tx.get("block_number", ""))[:8]
+                amount = float(tx.get("amount", 0) or 0)
+                symbol = tx.get("symbol", "?")
+                tx_type = tx.get("type", "?")
+                profit = float(tx.get("profit", 0) or 0)
+                icon = "🟢" if profit > 0 else "🔴" if profit < 0 else "⚪"
+                lines.append(
+                    f"{icon} {tx_type} {amount:.4f} {symbol} "
+                    f"(block: {blk[:6]}...) P/L: {profit:+.2f}"
+                )
+    else:
+        lines.append("\nNo transaction history available.")
+
+    lines.append(f"\n🔗 View on AVE Pro: https://pro.ave.ai/token/{addr}-{chain}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -423,7 +565,8 @@ def main():
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("signal", cmd_signal))
     app.add_handler(CommandHandler("trade", cmd_trade))
-    app.add_handler(CommandHandler("chain", cmd_chain))
+    app.add_handler(CommandHandler("topwallets", cmd_topwallets))
+    app.add_handler(CommandHandler("track", cmd_track))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_yes, pattern="trade_confirm_"))
 
