@@ -1,68 +1,62 @@
 # Avegram — Crypto Signal Bot + Spot Trading on Telegram
 
-Crypto trading bot that scans tokens for signals, tracks portfolios in USD, and executes spot trades — all from Telegram.
+**Telegram-native crypto trading: signal alerts + DEX execution via AVE Cloud API**
+
+[View on GitHub](https://github.com/uzochukwuV/Avegram) | [Try the Bot](https://t.me/Clawbuns_bot)
 
 ---
 
 ## What It Does
 
-**Signal Scanner** — Scans 30+ trending tokens on BSC and Solana, checks honeypot/rug/liq/risk, generates signals at 60%+ confidence with BUY/SELL/WATCH + entry/TP/SL.
+Avegram is a Telegram bot that monitors on-chain data for trading opportunities and lets users execute spot trades directly in chat — no KYC, no separate app.
 
-**Portfolio Tracker** — Multi-chain wallet per user. Shows all token holdings valued in USD using real-time Ave price feeds.
+### Features
 
-**Spot Trading** — Quote → Confirm → Execute flow. Users deposit USDT to their bot-managed wallet, trade any token on BSC/Solana by name.
-
----
-
-## Architecture
-
-```
-Telegram Bot (signal_telegram.py)
-├── bot_wallet.py         — HD wallet generation, user store (users.json)
-├── signal_bot.py          — CLI scanner (used by /signal command)
-└── trade_bot.py           — Quote/confirm/execute flow (used by /trade)
-
-Ave Cloud API
-├── /tokens               — Token search + price data
-├── /contracts            — Honeypot, rug, LP lock, risk level
-├── /address/walletinfo/tokens  — Portfolio holdings + USD values
-└── /v1/thirdParty/chainWallet/getAmountOut — Quote swap
-
-Blockchain (user's key)
-└── BSC / Solana — bot signs trades on user's behalf via chain wallet
-```
+- 🔔 **Signal Alerts** — Scans tokens by volume/liquidity, filters by honeypot risk and holder concentration, rates confidence 0–100%
+- 🐾 **Smart Money Tracking** — Follow top-performing wallets (900%+ profit trades) across BSC and Solana
+- 💹 **Spot Trading** — Quote → Confirm → Execute flow with AVE's 300+ DEX routing
+- 👛 **Multi-Chain Wallet** — HD wallet per user on BSC, ETH, Solana, Base
+- 💰 **Portfolio View** — Live USDT valuation of all holdings
 
 ---
 
-## Quick Start
+## AVE Cloud Skills Integration
 
-### Prerequisites
+This project uses the [AVE Cloud Skills](https://github.com/AveCloud/ave-cloud-skill) agent skill suite:
 
-- Python 3.10+
-- Telegram bot token ([create via @BotFather](https://t.me/BotFather))
-- Ave Cloud API key ([get free at cloud.ave.ai](https://cloud.ave.ai))
+| AVE Skill | Script | Used For |
+|---|---|---|
+| `ave-data-rest` | `ave_data_rest.py` | Token search, price/kline, honeypot checks, risk scoring |
+| `ave-trade-chain-wallet` | `ave_trade_rest.py` | Quote generation and transaction execution |
+| `ave-wallet-suite` | (routing) | Routes data vs. trade requests to correct skill |
 
-### Installation
+### How It Works
 
-```bash
-git clone https://github.com/uzochukwuV/Avegram.git
-cd Avegram
-pip install python-telegram-bot eth_account
-```
+1. **Signal Generation** (`ave-data-rest`)
+   - Token list via `GET /tokens?keyword=...&chain=bsc`
+   - Risk data via `GET /contracts/{token}-{chain}`
+   - Price + volume via `POST /tokens/price`
+   - Confidence score = liquidity (30pt) + volume (30pt) + price change (20pt) + no risk flags (20pt)
 
-### Configuration
+2. **Quote** (`ave-trade-chain-wallet`)
+   - `POST /v1/thirdParty/chainWallet/getAmountOut`
+   - Returns estimated output, decimals, spender address
 
-```bash
-export TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
-export AVE_API_KEY="your_ave_api_key"
-export API_PLAN="free"  # free | normal | pro
-```
+3. **Execute** (`ave-trade-chain-wallet`)
+   - `POST /v1/thirdParty/chainWallet/createEvmTx` — build unsigned tx
+   - Client-side sign with ETH private key
+   - `POST /v1/thirdParty/chainWallet/sendSignedEvmTx` — broadcast
 
-### Run
+---
 
-```bash
-python3 signal_telegram.py
-```
+## Supported Chains
+
+| Chain | Data | Signals | Trading |
+|---|---|---|---|
+| BSC | ✅ | ✅ | ✅ |
+| Solana | ✅ | ✅ | ✅ |
+| ETH | ✅ | ✅ | Partial (Ave data only, no write on free plan) |
+| Base | ✅ | ✅ | ✅ |
 
 ---
 
@@ -71,105 +65,151 @@ python3 signal_telegram.py
 | Command | Description |
 |---|---|
 | `/start` | Welcome message |
-| `/register` | Generate BSC wallet + address |
-| `/deposit` | Show deposit address (BSC BEP20 USDT) |
-| `/balance` | Portfolio — all tokens valued in USD |
-| `/chain bsc\|eth\|sol` | Switch network + generate new address |
-| `/signal` | Scan 30 tokens for signals ≥60% confidence |
-| `/trade SYMBOL AMOUNT` | Quote USDT→token, then confirm to execute |
-| `/help` | All commands |
+| `/register` | Create HD wallet (shows address) |
+| `/deposit` | Show deposit address |
+| `/balance` | Holdings + USDT valuation |
+| `/chain bsc\|eth\|sol` | Switch active chain |
+| `/signal` | Scan top tokens for signals (≥60% confidence) |
+| `/trade SYMBOL AMOUNT` | Get quote for USDT → token |
+| `/help` | Full command reference |
 
 ---
 
-## Signal Scoring (60–100% confidence)
+## Signal Confidence Scoring
 
-Each token scored across 5 checks:
+```
+Confidence Score (0–100):
+  + Liquidity > $50k       → 30 pts
+  + 24h Volume > $10k      → 30 pts
+  + Price change |Δ| > 5% → 20 pts
+  + No honeypot/risk flags → 20 pts
+  = Signal generated if ≥ 60 pts
+```
 
-| Check | Weight | Pass if |
+Signal levels:
+- 🟢 **BUY** — price down >3% (dip entry)
+- 🔴 **SELL** — price up >5% (take profit)
+- 🟡 **WATCH** — momentum building, monitor
+
+---
+
+## Architecture
+
+```
+Telegram User
+    │
+    ▼
+signal_telegram.py       ← Main bot (python-telegram-bot)
+    │
+    ├── bot_wallet.py     ← HD wallet generation (eth_account)
+    │
+    └── scripts/
+          └── signal_bot.py  ← AVE API integration (ave-cloud-skill)
+                │
+                ▼
+          ┌─────────────────────────────────┐
+          │    AVE Cloud API (cloud.ave.ai)   │
+          │  data.ave-api.xyz  +  bot-api.ave.ai  │
+          └─────────────────────────────────┘
+                │
+                ▼
+          ┌─────────────────────────────────┐
+          │    BSC / Solana / ETH / Base     │
+          │    DEX (PancakeSwap, Raydium…)   │
+          └─────────────────────────────────┘
+```
+
+---
+
+## Setup
+
+### Prerequisites
+
+- Python 3.10+
+- Telegram Bot Token ([get from @BotFather](https://t.me/BotFather))
+- AVE API Key ([get from cloud.ave.ai](https://cloud.ave.ai))
+
+### Install
+
+```bash
+git clone https://github.com/uzochukwuV/Avegram.git
+cd Avegram
+pip install python-telegram-bot eth_account aiohttp
+```
+
+### Run
+
+```bash
+export TELEGRAM_BOT_TOKEN="your_token_here"
+export AVE_API_KEY="your_ave_key_here"
+export API_PLAN="free"   # free | normal | pro
+python signal_telegram.py
+```
+
+### Environment Variables
+
+| Variable | Required | Description |
 |---|---|---|
-| Liquidity | +30 | TVL > $50K |
-| 24h Volume | +30 | Vol > $10K |
-| Price Movement | +20 | \|24h change\| > 5% |
-| Risk Level | +20 | Ave risk = 0 (clean) |
-
-Honeypot tokens (is_honeypot = 1) are skipped entirely.
-
-Output: BUY/SELL/WATCH + Entry price + TP1/TP2 + SL + Ave Pro link.
+| `TELEGRAM_BOT_TOKEN` | ✅ | Telegram bot token from @BotFather |
+| `AVE_API_KEY` | ✅ | Ave Cloud API key |
+| `API_PLAN` | ✅ | `free`, `normal`, or `pro` |
+| `AVE_BSC_RPC_URL` | Optional | BSC JSON-RPC URL (default: public RPC) |
+| `AVE_ETH_RPC_URL` | Optional | ETH JSON-RPC URL |
+| `AVE_BASE_RPC_URL` | Optional | Base JSON-RPC URL |
 
 ---
 
 ## Trading Flow
 
 ```
-/trade ODIC 10
-  → Search ODIC on BSC via Ave
-  → Get quote: 10 USDT → ~954 ODIC (via Ave DEX routing)
-  → Show confirmation with amounts + slippage
-  → User clicks ✅ Confirm
-  → Bot signs transaction with user's private key (stored locally)
-  → Broadcasts to BSC network via public RPC
-  → Returns tx hash
+1. /register          → Generates HD wallet, stores encrypted locally
+2. User deposits USDT → To their unique wallet address (BSC BEP20)
+3. /trade ODIC 10     → Bot calls Ave quote API
+                       → Displays: "You pay 10 USDT → ~954,341 ODIC"
+4. User confirms      → Bot builds unsigned tx
+                       → Signs locally with user's private key
+                       → Broadcasts via Ave API
+5. Done               → TX hash returned in chat
 ```
 
 ---
 
-## Multi-Chain Support
+## Demo Video
 
-| Chain | Signals | Portfolio | Trading |
-|---|---|---|---|
-| BSC | ✅ | ✅ | ✅ |
-| Solana | ✅ | ✅ | ✅ |
-| ETH | ✅ | ⚠️ Ave free tier | ⚠️ Ave free tier |
+> **Recording instructions:** Open Telegram → start Avegram bot → run `/register` → `/signal` → `/trade ODIC 10` → confirm. Total walkthrough: ~3 min.
 
-Switch chains: `/chain solana` — generates new Solana wallet, all balances separate per chain.
+*[Record a screen share of the Telegram bot interaction. Max 5 minutes.]*
 
 ---
 
-## Tech Stack
+## Hackathon Context
 
-- **Bot**: python-telegram-bot v21+, asyncio
-- **Wallet**: eth_account (HD wallet,secp256k1)
-- **API**: Ave Cloud API (REST + trade endpoints)
-- **Chain**: BSC (web3py), Solana (solders)
-- **Config**: environment variables
+**Track:** AVE Ecosystem — Trading + Monitoring Skills  
+**What we built:** SignalBot v2 — combines AVE `ave-data-rest` (signal generation) + `ave-trade-chain-wallet` (quote/execute) into a single Telegram-native product  
+**Innovation:** First Telegram-first DEX trading bot with integrated on-chain signal monitoring. Users get signal alerts AND can execute trades without leaving Telegram.
 
 ---
 
-## File Structure
+## Known Limitations
 
-```
-signal-bot/
-├── signal_telegram.py     # Telegram bot (main entrypoint)
-├── bot_wallet.py          # HD wallet generation + user store
-├── trade_bot.py           # Quote/confirm/execute for CLI testing
-├── scripts/
-│   └── signal_bot.py      # CLI scanner (used by /signal)
-├── users.json             # User wallet store (created on /register)
-└── ROC.md                 # Revenue model + competitor research
-```
+1. **No testnet** — Ave API runs on mainnet only. For hackathon demo, quote flow is shown without execution. Full execution works on mainnet with deposited funds.
+2. **Proxy wallet** (managed server-side wallet) requires API_PLAN=normal or pro — upgrade unlocks /withdraw and limit orders.
+3. **ETH write API** — ETH chain write operations are blocked on free plan. BSC/Solana/Base are fully functional.
+4. **RPC dependency** — Balance checks require a public BSC RPC. If the default RPC is rate-limited, set `AVE_BSC_RPC_URL` manually.
 
 ---
 
-## Revenue Model
+## Roadmap
 
-See [ROC.md](./ROC.md) for full analysis. Summary:
-
-- **Free tier**: signal alerts only
-- **Premium ($9.99/mo)**: full trading + portfolio + unlimited signals
-- **Copy trading**: follow top smart wallets (phase 2)
-
-Competitors: Maestro (free), Banana (14 ETH/mo), Phantom (free).
-
----
-
-## Limitations (Free Plan)
-
-- `/address/balance/{addr}-eth` — 404 (ETH chain data not available on free)
-- Proxy wallet — requires API_PLAN=normal or pro
-- Data WSS streams — requires API_PLAN=pro
+- [ ] **v1.1** — Record demo video + submit to hackathon
+- [ ] **v1.2** — Upgrade to API_PLAN=normal for proxy wallet (/withdraw)
+- [ ] **v2.0** — `/track <wallet>` — follow specific smart money wallets
+- [ ] **v2.1** — `/subscribe <token>` — get Telegram alert when a token hits signal threshold
+- [ ] **v2.2** — Limit orders via proxy wallet (TP/SL)
+- [ ] **v3.0** — Mobile-optimized web dashboard + Telegram mini app
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE)
