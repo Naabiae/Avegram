@@ -130,6 +130,7 @@ async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "cb_deposit":
         await cmd_deposit(u, ctx, is_callback=True)
     elif data == "cb_withdraw":
+        auto_link_wallet(str(uid), u.effective_user.username)
         users = load_users()
         uid_str = str(uid)
         users[uid_str]["state"] = "awaiting_withdraw_address"
@@ -137,6 +138,7 @@ async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("🔙 Cancel", callback_data="cb_menu")]]
         await query.message.edit_text("💸 *Withdraw Funds*\n\nPlease paste the destination BSC address:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     elif data == "cb_trade":
+        auto_link_wallet(str(uid), u.effective_user.username)
         users = load_users()
         uid_str = str(uid)
         users[uid_str]["state"] = "awaiting_trade_input"
