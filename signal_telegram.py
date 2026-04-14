@@ -142,15 +142,24 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     for tok in data["data"]:
         bal = float(tok.get("balance_amount", 0) or 0)
-        usd = float(tok.get("balance_usd", 0) or 0)
         if bal <= 0:
             continue
         symbol = tok.get("symbol", "?")
         token_addr = tok.get("token", "")
         chain_tok = tok.get("chain", chain)
+        # Fetch live USD price for this token
+        price = None
+        try:
+            price_resp = await api_get(f"/tokens/{token_addr}-{chain_tok}")
+            pdata = price_resp.json().get("data", {}).get("token", {})
+            price = float(pdata.get("current_price_usd") or 0)
+        except:
+            pass
+        usd = float(tok.get("balance_usd", 0) or (bal * price) if price else 0)
         risk = tok.get("risk_level", 1)
         risk_icon = "🟢" if risk == 1 else "🟡" if risk == 2 else "🔴"
-        holdings.append(f"{risk_icon} {symbol}: {bal:.4f} (${usd:.2f})")
+        price_str = f" (${price:.6f})" if price else " (!)"
+        holdings.append(f"{risk_icon} {symbol}: {bal:.4f} (${usd:.2f}){price_str}")
         total_usd += usd
 
     if not holdings:
@@ -178,30 +187,62 @@ async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Scanning top tokens for signals (60%+ confidence)...")
 
     try:
-        # /tokens requires keyword - search popular BSC tokens by name
-        bsc_keywords = ["PEPE", "SHIBA", "DOGE", "BNB", "CAKE", "WBNB", "BTC", "ETH", "SOL", "XRP",
-                        "TRX", "ADA", "AVAX", "DOT", "MATIC", "LINK", "XLM", "ATOM", "UNI"]
-        tokens = []
-        for kw in bsc_keywords:
-            resp = await api_get("/tokens", {"keyword": kw, "limit": 2, "chain": "bsc"})
-            for t in resp.json().get("data", []):
-                if t.get("chain") == "bsc" and t.get("token"):
-                    tokens.append(t)
-        # Deduplicate by token address
+        # Use trending tokens from public signals endpoint as primary source
+        # Supplement with keyword searches for coverage
         seen = set()
-        unique_tokens = []
-        for t in tokens:
-            addr = t.get("token", "").split("-")[0] if "-" in t.get("token", "") else t.get("token", "")
-            if addr and addr not in seen:
-                seen.add(addr)
-                t["token"] = addr
-                unique_tokens.append(t)
+        tokens = []
+        
+        # First: get public signals (already filtered by Ave)
+        try:
+            sig_resp = await api_get("/signals/public/list", {
+                "chain": "bsc", "pageSize": 20, "pageNO": 1
+            })
+            for s in sig_resp.json().get("data", []):
+                t = s.get("token_info", {})
+                if not t:
+                    t = s
+                addr = t.get("token", "").split("-")[0] if "-" in t.get("token", "") else t.get("token", "")
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    t["token"] = addr
+                    tokens.append(t)
+        except:
+            pass
+        
+        # Second: get trending/hot tokens from platform tags
+        platform_tags = ["defi", "meme", "gamefi", "ai", "hot"]
+        for tag in platform_tags:
+            try:
+                presp = await api_get("/tokens/platform", {"tag": tag, "limit": 10, "chain": "bsc"})
+                for t in presp.json().get("data", []):
+                    addr = t.get("token", "").split("-")[0] if "-" in t.get("token", "") else t.get("token", "")
+                    if addr and addr not in seen:
+                        seen.add(addr)
+                        t["token"] = addr
+                        tokens.append(t)
+            except:
+                pass
+        
+        # Third: supplement with popular keyword searches
+        bsc_keywords = ["PEPE", "SHIB", "DOGE", "BNB", "CAKE", "WBNB", "BTC", "ETH", 
+                        "SOL", "XRP", "TRX", "ADA", "AVAX", "DOT", "MATIC", "LINK"]
+        for kw in bsc_keywords:
+            try:
+                resp = await api_get("/tokens", {"keyword": kw, "limit": 3, "chain": "bsc"})
+                for t in resp.json().get("data", []):
+                    addr = t.get("token", "").split("-")[0] if "-" in t.get("token", "") else t.get("token", "")
+                    if addr and addr not in seen:
+                        seen.add(addr)
+                        t["token"] = addr
+                        tokens.append(t)
+            except:
+                pass
     except Exception as e:
         await update.message.reply_text(f"Error scanning: {e}")
         return
 
     signals = []
-    for tok in unique_tokens[:30]:
+    for tok in tokens[:30]:
         try:
             token_addr = tok.get("token", "")
             token_id = f"{token_addr}-bsc"
