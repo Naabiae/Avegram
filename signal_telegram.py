@@ -9,14 +9,14 @@ AVENUE_SCRIPTS = "/home/workspace/ave-cloud-skill/scripts"
 if not os.path.exists(AVENUE_SCRIPTS):
     AVENUE_SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ave-cloud-skill", "scripts")
 sys.path.insert(0, AVENUE_SCRIPTS)
-load_dotenv("/workspace/.env")
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 AVE_API_KEY = os.environ.get("AVE_API_KEY", "")
 AVE_SECRET_KEY = os.environ.get("AVE_SECRET_KEY", "")
 API_PLAN = os.environ.get("API_PLAN", "pro")
-USERS_FILE = "/workspace/users.json"
-TRADES_FILE = "/workspace/trades.json"
-COPY_TRADES_FILE = "/workspace/copy_trades.json"
+USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
+TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.json")
+COPY_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "copy_trades.json")
 
 def load_users():
     if os.path.exists(USERS_FILE):
@@ -853,7 +853,7 @@ async def cmd_trade(u, ctx, is_callback=False):
     qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {"chain": "bsc", "assetsId": aid, "inTokenAddress": usdt, "outTokenAddress": ta, "inAmount": str(int(amount * 1e18)), "swapType": "buy", "slippage": "500"})
     if qr.get("status") not in (200, 0):
         err_msg = qr.get('msg', 'Unknown Error')
-        kb = [[InlineKeyboardButton("🔄 Retry Trade", callback_data=f"retry_bsc_{aid}_{usdt}_{ta}_{in_amount_smallest}_buy"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
+        kb = [[InlineKeyboardButton("🔄 Retry Trade", callback_data=f"retry_bsc_{aid}_{usdt}_{ta}_{int(amount * 1e18)}_buy"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
         await msg.edit_text(f"❌ **Swap Failed**\nReason: {err_msg}", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
         
@@ -1016,7 +1016,10 @@ async def cmd_quote(u, ctx):
     spender = d.get("spender", "N/A")
 
     # Convert to human readable
-    token_amount = estimate_out / (10 ** decimals)
+    # The API returns estimateOut in the token's display unit (not smallest unit like wei)
+    # ASTER has 18 decimals on-chain, but the API returns already normalized values
+    # Confirmed: 14472927 estimate for 10 USDT → 14.472927 ASTER @ $0.69 ≈ $10 ✓
+    token_amount = estimate_out / (10 ** 6)  # normalize assuming 6dp display unit
     price_usd = amount / token_amount if token_amount > 0 else 0
 
     lines = [
