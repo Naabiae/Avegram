@@ -1,6 +1,7 @@
 import json
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.pq import TransactionStatus
 
 from .config import DB_URL
 
@@ -13,117 +14,129 @@ def db_conn():
     if _DB_CONN is None or _DB_CONN.closed:
         _DB_CONN = psycopg.connect(DB_URL, connect_timeout=10)
         _DB_CONN.autocommit = False
+    try:
+        if _DB_CONN.info.transaction_status == TransactionStatus.INERROR:
+            _DB_CONN.rollback()
+    except Exception:
+        pass
     return _DB_CONN
 
 def db_init():
     conn = db_conn()
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id TEXT PRIMARY KEY,
-                username TEXT,
-                chain TEXT DEFAULT 'bsc',
-                assets_id TEXT,
-                address_list JSONB,
-                state TEXT,
-                session JSONB,
-                created_at TIMESTAMPTZ DEFAULT now(),
-                updated_at TIMESTAMPTZ DEFAULT now()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                telegram_id TEXT NOT NULL,
-                token_address TEXT NOT NULL,
-                chain TEXT NOT NULL,
-                symbol TEXT,
-                entry_price NUMERIC,
-                invested_usdt NUMERIC,
-                tp_pct NUMERIC,
-                sl_pct NUMERIC,
-                status TEXT,
-                created_at TIMESTAMPTZ DEFAULT now(),
-                updated_at TIMESTAMPTZ DEFAULT now(),
-                PRIMARY KEY (telegram_id, token_address, chain)
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS copy_trades (
-                telegram_id TEXT NOT NULL,
-                target_wallet TEXT NOT NULL,
-                chain TEXT NOT NULL,
-                pct_allocation NUMERIC,
-                max_usdt_per_trade NUMERIC,
-                last_tx_hash TEXT,
-                status TEXT,
-                created_at TIMESTAMPTZ DEFAULT now(),
-                updated_at TIMESTAMPTZ DEFAULT now(),
-                PRIMARY KEY (telegram_id, target_wallet, chain)
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS signal_history (
-                symbol TEXT,
-                signal_type TEXT,
-                confidence NUMERIC,
-                entry_price NUMERIC,
-                status TEXT,
-                pnl_pct NUMERIC,
-                created_at TIMESTAMPTZ DEFAULT now(),
-                expiry_time BIGINT
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS swap_orders (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id TEXT,
-                order_id TEXT,
-                chain TEXT,
-                in_token TEXT,
-                out_token TEXT,
-                in_amount TEXT,
-                swap_type TEXT,
-                status TEXT,
-                ave_status TEXT,
-                ave_msg TEXT,
-                context JSONB,
-                raw_response JSONB,
-                created_at TIMESTAMPTZ DEFAULT now()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS bot_errors (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id TEXT,
-                area TEXT,
-                message TEXT,
-                context JSONB,
-                created_at TIMESTAMPTZ DEFAULT now()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS task_heartbeats (
-                task_name TEXT PRIMARY KEY,
-                last_ok_at TIMESTAMPTZ,
-                last_error_at TIMESTAMPTZ,
-                error_count BIGINT DEFAULT 0,
-                last_error TEXT,
-                updated_at TIMESTAMPTZ DEFAULT now()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS token_meta (
-                chain TEXT NOT NULL,
-                token_address TEXT NOT NULL,
-                symbol TEXT,
-                decimals INT,
-                updated_at TIMESTAMPTZ DEFAULT now(),
-                PRIMARY KEY (chain, token_address)
-            )
-        """)
-        cur.execute("ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS last_tx_time BIGINT")
-        cur.execute("ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS last_tx_block BIGINT")
-    conn.commit()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id TEXT PRIMARY KEY,
+                    username TEXT,
+                    chain TEXT DEFAULT 'bsc',
+                    assets_id TEXT,
+                    address_list JSONB,
+                    state TEXT,
+                    session JSONB,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    telegram_id TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    chain TEXT NOT NULL,
+                    symbol TEXT,
+                    entry_price NUMERIC,
+                    invested_usdt NUMERIC,
+                    tp_pct NUMERIC,
+                    sl_pct NUMERIC,
+                    status TEXT,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ DEFAULT now(),
+                    PRIMARY KEY (telegram_id, token_address, chain)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS copy_trades (
+                    telegram_id TEXT NOT NULL,
+                    target_wallet TEXT NOT NULL,
+                    chain TEXT NOT NULL,
+                    pct_allocation NUMERIC,
+                    max_usdt_per_trade NUMERIC,
+                    last_tx_hash TEXT,
+                    status TEXT,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    updated_at TIMESTAMPTZ DEFAULT now(),
+                    PRIMARY KEY (telegram_id, target_wallet, chain)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signal_history (
+                    symbol TEXT,
+                    signal_type TEXT,
+                    confidence NUMERIC,
+                    entry_price NUMERIC,
+                    status TEXT,
+                    pnl_pct NUMERIC,
+                    created_at TIMESTAMPTZ DEFAULT now(),
+                    expiry_time BIGINT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS swap_orders (
+                    id BIGSERIAL PRIMARY KEY,
+                    telegram_id TEXT,
+                    order_id TEXT,
+                    chain TEXT,
+                    in_token TEXT,
+                    out_token TEXT,
+                    in_amount TEXT,
+                    swap_type TEXT,
+                    status TEXT,
+                    ave_status TEXT,
+                    ave_msg TEXT,
+                    context JSONB,
+                    raw_response JSONB,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_errors (
+                    id BIGSERIAL PRIMARY KEY,
+                    telegram_id TEXT,
+                    area TEXT,
+                    message TEXT,
+                    context JSONB,
+                    created_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS task_heartbeats (
+                    task_name TEXT PRIMARY KEY,
+                    last_ok_at TIMESTAMPTZ,
+                    last_error_at TIMESTAMPTZ,
+                    error_count BIGINT DEFAULT 0,
+                    last_error TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS token_meta (
+                    chain TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    symbol TEXT,
+                    decimals INT,
+                    updated_at TIMESTAMPTZ DEFAULT now(),
+                    PRIMARY KEY (chain, token_address)
+                )
+            """)
+            cur.execute("ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS last_tx_time BIGINT")
+            cur.execute("ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS last_tx_block BIGINT")
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
 
 _USER_RESERVED_KEYS = {"username", "chain", "assets_id", "address_list", "state"}
 
@@ -409,4 +422,3 @@ def db_upsert_token_meta(chain, token_address, symbol=None, decimals=None):
         conn.commit()
     except Exception:
         pass
-
