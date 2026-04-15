@@ -3,5 +3,3 @@ users.json
 .env
 __pycache__/
 *.pyc
-trades.json
-copy_trades.json
