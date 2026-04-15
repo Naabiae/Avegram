@@ -14,46 +14,406 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 AVE_API_KEY = os.environ.get("AVE_API_KEY", "")
 AVE_SECRET_KEY = os.environ.get("AVE_SECRET_KEY", "")
 API_PLAN = os.environ.get("API_PLAN", "pro")
-USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.json")
-TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.json")
-COPY_TRADES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "copy_trades.json")
-ALERT_CHANNEL = "@AvegramAlerts"
+_bot_app = None  # global bot instance for use in command handlers
+# ===== JSON FILE CONSTANTS (fallback when DB unavailable) =====
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USERS_FILE = os.path.join(BASE_DIR, "users.json")
+TRADES_FILE = os.path.join(BASE_DIR, "trades.json")
+COPY_TRADES_FILE = os.path.join(BASE_DIR, "copy_trades.json")
+SIGNAL_HISTORY_FILE = os.path.join(BASE_DIR, "signal_history.json")
+# ===== DATABASE LAYER =====
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+def db_connect():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+# ---- Users ----
+def db_get_user(uid):
+    conn = db_connect()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+def db_save_user(uid, username="", assets_id="", address_list=None, chain="bsc"):
+    conn = db_connect()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (id, username, assets_id, address_list, chain)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                username=EXCLUDED.username,
+                assets_id=EXCLUDED.assets_id,
+                address_list=EXCLUDED.address_list,
+                chain=EXCLUDED.chain
+        """, (uid, username, assets_id, json.dumps(address_list or []), chain))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def db_get_all_users():
+    conn = db_connect()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE assets_id IS NOT NULL")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+def db_delete_user(uid):
+    conn = db_connect()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM users WHERE id = %s", (uid,))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+# ---- Trades ----
+def db_save_trade(uid, token_address, symbol, chain, entry_price, invested_usdt, tp_pct, sl_pct, status="active"):
+    conn = db_connect()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trades (user_id, token_address, symbol, chain, entry_price, invested_usdt, tp_pct, sl_pct, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, token_address) DO UPDATE SET
+                symbol=EXCLUDED.symbol, chain=EXCLUDED.chain, entry_price=EXCLUDED.entry_price,
+                invested_usdt=EXCLUDED.invested_usdt, tp_pct=EXCLUDED.tp_pct, sl_pct=EXCLUDED.sl_pct, status=EXCLUDED.status
+        """, (uid, token_address, symbol, chain, entry_price, invested_usdt, tp_pct, sl_pct, status))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def db_get_user_trades(uid):
+    conn = db_connect()
+    if not conn:
+        return {}
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM trades WHERE user_id = %s AND status = 'active'", (uid,))
+        rows = cur.fetchall()
+        return {r['token_address']: dict(r) for r in rows}
+    finally:
+        conn.close()
+
+def db_get_all_active_trades():
+    conn = db_connect()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT t.*, u.assets_id FROM trades t JOIN users u ON t.user_id = u.id WHERE t.status = 'active'")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+def db_close_trade(uid, token_address):
+    conn = db_connect()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE trades SET status = 'closed' WHERE user_id = %s AND token_address = %s", (uid, token_address))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+# ---- Copy Trades ----
+def db_save_copy_trade(uid, target_wallet, chain, pct_allocation, max_usdt_per_trade, last_tx_hash, status="active"):
+    conn = db_connect()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO copy_trades (user_id, target_wallet, chain, pct_allocation, max_usdt_per_trade, last_tx_hash, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, target_wallet) DO UPDATE SET
+                pct_allocation=EXCLUDED.pct_allocation, max_usdt_per_trade=EXCLUDED.max_usdt_per_trade,
+                last_tx_hash=EXCLUDED.last_tx_hash, status=EXCLUDED.status
+        """, (uid, target_wallet, chain, pct_allocation, max_usdt_per_trade, last_tx_hash, status))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def db_get_user_copy_trades(uid):
+    conn = db_connect()
+    if not conn:
+        return {}
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM copy_trades WHERE user_id = %s AND status = 'active'", (uid,))
+        rows = cur.fetchall()
+        return {r['target_wallet']: dict(r) for r in rows}
+    finally:
+        conn.close()
+
+def db_get_all_active_copy_trades():
+    conn = db_connect()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT ct.*, u.assets_id FROM copy_trades ct JOIN users u ON ct.user_id = u.id WHERE ct.status = 'active'")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+def db_update_copy_trade_tx(uid, target_wallet, last_tx_hash):
+    conn = db_connect()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE copy_trades SET last_tx_hash = %s WHERE user_id = %s AND target_wallet = %s", (last_tx_hash, uid, target_wallet))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+# ---- Signal History ----
+def db_save_signal(signal_id, symbol, token_address, chain, signal_type, confidence, entry_price, duration_hours=4):
+    conn = db_connect()
+    if not conn:
+        return False
+    try:
+        from datetime import datetime, timezone, timedelta
+        cur = conn.cursor()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
+        cur.execute("""
+            INSERT INTO signal_history (signal_id, symbol, token_address, chain, signal_type, confidence, entry_price, duration_hours, status, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s)
+            ON CONFLICT (signal_id) DO NOTHING
+        """, (signal_id, symbol, token_address, chain, signal_type, confidence, entry_price, duration_hours, expires_at))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def db_close_signal(signal_id, close_price, pnl_pct, result):
+    conn = db_connect()
+    if not conn:
+        return False
+    try:
+        from datetime import datetime, timezone
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE signal_history SET status='closed', close_price=%s, pnl_pct=%s, result=%s, closed_at=NOW()
+            WHERE signal_id=%s
+        """, (close_price, pnl_pct, result, signal_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def db_get_active_signals():
+    conn = db_connect()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM signal_history WHERE status = 'active'")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+def db_get_signal_stats():
+    conn = db_connect()
+    if not conn:
+        return {}
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'closed') as closed,
+                COUNT(*) FILTER (WHERE status = 'active') as active,
+                COUNT(*) FILTER (WHERE result = 'won') as won,
+                COUNT(*) FILTER (WHERE result = 'lost') as lost,
+                AVG(pnl_pct) FILTER (WHERE status = 'closed') as avg_pnl,
+                MAX(pnl_pct) FILTER (WHERE status = 'closed') as best,
+                MIN(pnl_pct) FILTER (WHERE status = 'closed') as worst,
+                AVG(confidence) as avg_confidence
+            FROM signal_history
+        """)
+        return dict(cur.fetchone())
+    finally:
+        conn.close()
+
+def db_get_recent_signals(limit=10):
+    conn = db_connect()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM signal_history ORDER BY created_at DESC LIMIT %s", (limit,))
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+# ===== BACKWARD COMPATIBILITY (file-based fallback) =====
+# Keep JSON file ops as fallback if DB is not available
 
 def load_users():
+    db_user = db_get_user_all_map()
+    if db_user:
+        return db_user
     if os.path.exists(USERS_FILE):
         with open(USERS_FILE) as f: return json.load(f)
     return {}
 
+def db_get_user_all_map():
+    conn = db_connect()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, username, assets_id, address_list, chain FROM users")
+        rows = cur.fetchall()
+        if not rows:
+            return None
+        result = {}
+        for r in rows:
+            result[str(r['id'])] = {
+                "username": r['username'] or '',
+                "assets_id": r['assets_id'] or '',
+                "address_list": r['address_list'] or [],
+                "chain": r['chain'] or 'bsc'
+            }
+        return result
+    finally:
+        conn.close()
+
 def save_users(u):
-    with open(USERS_FILE, "w") as f: json.dump(u, f, indent=2)
+    if not u:
+        return
+    conn = db_connect()
+    if conn:
+        try:
+            for uid, data in u.items():
+                db_save_user(int(uid), data.get('username', ''), data.get('assets_id', ''), data.get('address_list', []), data.get('chain', 'bsc'))
+        finally:
+            conn.close()
+    else:
+        with open(USERS_FILE, "w") as f:
+            json.dump(u, f, indent=2)
 
 def load_trades():
+    conn = db_connect()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT t.*, u.assets_id FROM trades t JOIN users u ON t.user_id = u.id WHERE t.status = 'active'")
+            rows = cur.fetchall()
+            if rows:
+                result = {}
+                for r in rows:
+                    uid = str(r['user_id'])
+                    if uid not in result:
+                        result[uid] = {}
+                    result[uid][r['token_address']] = {
+                        "symbol": r['symbol'],
+                        "chain": r['chain'],
+                        "entry_price": float(r['entry_price']) if r['entry_price'] else 0,
+                        "invested_usdt": float(r['invested_usdt']) if r['invested_usdt'] else 0,
+                        "tp_pct": float(r['tp_pct']) if r['tp_pct'] else 0,
+                        "sl_pct": float(r['sl_pct']) if r['sl_pct'] else 0,
+                        "status": r['status'],
+                        "assets_id": r['assets_id']
+                    }
+                return result
+        finally:
+            conn.close()
     if os.path.exists(TRADES_FILE):
         with open(TRADES_FILE) as f: return json.load(f)
     return {}
 
 def save_trades(t):
-    with open(TRADES_FILE, "w") as f: json.dump(t, f, indent=2)
+    if not t:
+        return
+    conn = db_connect()
+    if conn:
+        try:
+            for uid, user_trades in t.items():
+                for ta, data in user_trades.items():
+                    db_save_trade(int(uid), ta, data.get('symbol', ''), data.get('chain', 'bsc'),
+                                  data.get('entry_price', 0), data.get('invested_usdt', 0),
+                                  data.get('tp_pct', 0), data.get('sl_pct', 0), data.get('status', 'active'))
+        finally:
+            conn.close()
+    else:
+        with open(TRADES_FILE, "w") as f:
+            json.dump(t, f, indent=2)
 
 def load_copy_trades():
+    conn = db_connect()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT ct.*, u.assets_id FROM copy_trades ct JOIN users u ON ct.user_id = u.id WHERE ct.status = 'active'")
+            rows = cur.fetchall()
+            if rows:
+                result = {}
+                for r in rows:
+                    uid = str(r['user_id'])
+                    if uid not in result:
+                        result[uid] = {}
+                    result[uid][r['target_wallet']] = {
+                        "chain": r['chain'],
+                        "pct_allocation": float(r['pct_allocation']) if r['pct_allocation'] else 10,
+                        "max_usdt_per_trade": float(r['max_usdt_per_trade']) if r['max_usdt_per_trade'] else 50,
+                        "last_tx_hash": r['last_tx_hash'] or '',
+                        "status": r['status'],
+                        "assets_id": r['assets_id']
+                    }
+                return result
+        finally:
+            conn.close()
     if os.path.exists(COPY_TRADES_FILE):
         with open(COPY_TRADES_FILE) as f: return json.load(f)
     return {}
 
 def save_copy_trades(t):
-    with open(COPY_TRADES_FILE, "w") as f: json.dump(t, f, indent=2)
-
-SIGNAL_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signal_history.json")
-
-def load_signal_history():
-    if os.path.exists(SIGNAL_HISTORY_FILE):
-        with open(SIGNAL_HISTORY_FILE) as f: return json.load(f)
-    return []
-
-def save_signal_history(h):
-    with open(SIGNAL_HISTORY_FILE, "w") as f: json.dump(h, f, indent=2)
-
-def proxy_headers(method, path, body=None):
+    if not t:
+        return
+    conn = db_connect()
+    if conn:
+        try:
+            for uid, targets in t.items():
+                for tw, data in targets.items():
+                    db_save_copy_trade(int(uid), tw, data.get('chain', 'bsc'),
+                                       data.get('pct_allocation', 10), data.get('max_usdt_per_trade', 50),
+                                       data.get('last_tx_hash', ''), data.get('status', 'active'))
+        finally:
+            conn.close()
+    else:
+        with open(COPY_TRADES_FILE, "w") as f:
+            json.dump(t, f, indent=2)
     import base64, datetime, hashlib, hmac
     ts = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     msg = ts + method.upper() + path
@@ -93,6 +453,7 @@ async def show_main_menu(message, uid, edit=False, username=""):
             [InlineKeyboardButton("💱 Trade", callback_data="cb_trade"), InlineKeyboardButton("📡 Scan Signals", callback_data="cb_signal")],
             [InlineKeyboardButton("⬇️ Deposit", callback_data="cb_deposit"), InlineKeyboardButton("⬆️ Withdraw", callback_data="cb_withdraw")],
             [InlineKeyboardButton("🐋 Smart Money Wallets", callback_data="cb_topwallets")],
+            [InlineKeyboardButton("📊 Analytics", callback_data="cb_analytics")],
             [InlineKeyboardButton("❓ Help", callback_data="cb_help")]
         ]
     
@@ -114,6 +475,8 @@ async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             users[str(uid)]["state"] = None
             save_users(users)
         await show_main_menu(query.message, uid, edit=True, username=u.effective_user.username)
+    elif data == "cb_analytics":
+        await cmd_analytics(u, ctx, is_callback=True)
     elif data.startswith("sell_"):
         parts = data.split("_")
         if len(parts) >= 3:
@@ -1042,6 +1405,11 @@ async def cmd_signal(u, ctx, is_callback=False):
     if not signals:
         await msg.edit_text("No signals above 60% confidence right now. Try again later.", reply_markup=rm)
         return
+
+    # Store signals to history (so dashboard can show them)
+    for s in signals[:8]:
+        _store_signal(s["sym"], s["chain"], "buy", s["conf"], s["price"], duration_hrs=4)
+
     lines = [f"🔔 {len(signals)} Signals Found (≥60% confidence)\n"]
     buttons = []
     for s in signals[:8]:
@@ -1059,6 +1427,28 @@ async def cmd_signal(u, ctx, is_callback=False):
     new_rm = InlineKeyboardMarkup(buttons)
     
     await msg.edit_text("\n".join(lines), reply_markup=new_rm, parse_mode="Markdown")
+    
+    # Store signals in DB and broadcast to channel
+    for s in signals[:8]:
+        try:
+            _store_signal(s["sym"], s["chain"], "buy", s["conf"], s["price"], duration_hrs=4)
+        except Exception as e:
+            print(f"_store_signal error: {e}")
+    if signals:
+        channel_msg = "🔔 *Signal Alert — BSC*\n\n"
+        for s in signals[:5]:
+            emoji = "🟢 BUY" if s["chg"] < -3 else "🔴 BUY"
+            channel_msg += f"{emoji} [{s["conf"]:.0f}%] *{s["sym"]}*\n"
+            channel_msg += f"Price: `${s["price"]:.8f}` | 24h: {s["chg"]:+.1f}%\n"
+            channel_msg += f"Liq: ${s["liq"]:,.0f}\n\n"
+        channel_msg += "_Powered by Avegram_"
+        try:
+            if _bot_app:
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: _bot_app.bot.send_message(chat_id=ALERT_CHANNEL, text=channel_msg, parse_mode="Markdown")
+                )
+        except Exception as e:
+            print(f"Channel broadcast error: {e}")
 
 async def cmd_trade(u, ctx, is_callback=False):
     uid = str(u.effective_user.id)
@@ -1417,17 +1807,18 @@ async def cmd_analytics(u, ctx, is_callback=False):
           [InlineKeyboardButton("🔙 Back to Menu", callback_data="cb_menu")]]
     rm = InlineKeyboardMarkup(kb)
 
+    stats = db_get_signal_stats()
     history = load_signal_history()
     active = [s for s in history if s["status"] == "active"]
-    closed = [s for s in history if s["status"] in ("won", "lost")]
-    won = [s for s in closed if s["status"] == "won"]
-    lost = [s for s in closed if s["status"] == "lost"]
+    closed_count = stats.get("closed", 0) or 0
+    won_count = stats.get("won", 0) or 0
+    lost_count = stats.get("lost", 0) or 0
+    avg_pnl_val = stats.get("avg_pnl") or 0
+    best_pnl = stats.get("best") or 0
+    worst_pnl = stats.get("worst") or 0
 
-    win_rate = len(won) / len(closed) * 100 if closed else 0
-    avg_pnl = sum(s["pnl_pct"] or 0 for s in won) / len(won) if won else 0
-    avg_loss = sum(s["pnl_pct"] or 0 for s in lost) / len(lost) if lost else 0
-
-    total_return = sum(s["pnl_pct"] or 0 for s in closed)
+    win_rate = won_count / closed_count * 100 if closed_count else 0
+    total_return = sum(s["pnl_pct"] or 0 for s in history if s["status"] in ("won", "lost"))
 
     lines = [
         "📊 *Signal Analytics*\n",
@@ -1448,16 +1839,23 @@ async def cmd_analytics(u, ctx, is_callback=False):
     ]
 
     if closed:
-        best = max(closed, key=lambda s: s["pnl_pct"] or 0)
-        worst = min(closed, key=lambda s: s["pnl_pct"] or 0)
-        lines += [
-            "",
-            f"*Best Signal*",
-            f"  {best['symbol']}: {best['pnl_pct']:+.2f}%",
-            "",
-            f"*Worst Signal*",
-            f"  {worst['symbol']}: {worst['pnl_pct']:+.2f}%",
-        ]
+        if best_pnl != 0 or worst_pnl != 0:
+            cur = conn.cursor() if 'conn' in dir() else None
+            try:
+                cur.execute("SELECT symbol, pnl_pct FROM signal_history WHERE status='closed' AND pnl_pct IS NOT NULL ORDER BY pnl_pct DESC LIMIT 1") if cur else None
+                best_row = cur.fetchone() if cur else None
+                cur.execute("SELECT symbol, pnl_pct FROM signal_history WHERE status='closed' AND pnl_pct IS NOT NULL ORDER BY pnl_pct ASC LIMIT 1") if cur else None
+                worst_row = cur.fetchone() if cur else None
+            finally:
+                if cur: conn.close()
+            lines += [
+                "",
+                f"*Best Signal*",
+                f"  {best_row[0] if best_row else 'N/A'}: {best_pnl:+.2f}%",
+                "",
+                f"*Worst Signal*",
+                f"  {worst_row[0] if worst_row else 'N/A'}: {worst_pnl:+.2f}%",
+            ]
 
     lines += ["", "_Refreshes every 5 minutes_"]
     await msg.edit_text("\n".join(lines), reply_markup=rm, parse_mode="Markdown")
@@ -1663,6 +2061,8 @@ def main():
     
     app.post_init = lambda a: run_tasks()
     
+    global _bot_app
+    _bot_app = app
     print("Avegram v2 running on proxy wallet mode...")
     app.run_polling()
 
