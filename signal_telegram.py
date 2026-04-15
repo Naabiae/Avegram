@@ -1,7 +1,7 @@
 """SignalBot v2 - Ave proxy wallet integration"""
 import os, json, asyncio, sys, urllib.request, urllib.parse, base64, datetime, hmac, hashlib
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
@@ -24,7 +24,7 @@ def db_conn():
     if not DB_URL:
         raise RuntimeError("DATABASE_URL not set")
     if _DB_CONN is None or _DB_CONN.closed:
-        _DB_CONN = psycopg2.connect(DB_URL, connect_timeout=10)
+        _DB_CONN = psycopg.connect(DB_URL, connect_timeout=10)
         _DB_CONN.autocommit = False
     return _DB_CONN
 
@@ -124,9 +124,38 @@ def db_init():
                 updated_at TIMESTAMPTZ DEFAULT now()
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS token_meta (
+                chain TEXT NOT NULL,
+                token_address TEXT NOT NULL,
+                symbol TEXT,
+                decimals INT,
+                updated_at TIMESTAMPTZ DEFAULT now(),
+                PRIMARY KEY (chain, token_address)
+            )
+        """)
         cur.execute("ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS last_tx_time BIGINT")
         cur.execute("ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS last_tx_block BIGINT")
     conn.commit()
+
+def db_upsert_token_meta(chain, token_address, symbol=None, decimals=None):
+    try:
+        conn = db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO token_meta (chain, token_address, symbol, decimals, updated_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (chain, token_address) DO UPDATE SET
+                    symbol = EXCLUDED.symbol,
+                    decimals = EXCLUDED.decimals,
+                    updated_at = now()
+                """,
+                (chain, token_address, symbol, int(decimals) if decimals is not None else None),
+            )
+        conn.commit()
+    except Exception:
+        pass
 
 def db_log_error(area, message, telegram_id=None, context=None):
     try:
@@ -221,7 +250,7 @@ _USER_RESERVED_KEYS = {"username", "chain", "assets_id", "address_list", "state"
 
 def load_users():
     conn = db_conn()
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT telegram_id, username, chain, assets_id, address_list, state, session FROM users")
         rows = cur.fetchall()
     users = {}
@@ -272,7 +301,7 @@ def save_users(u):
 
 def load_trades():
     conn = db_conn()
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT telegram_id, token_address, chain, symbol, entry_price, invested_usdt, tp_pct, sl_pct, status FROM trades")
         rows = cur.fetchall()
     trades = {}
@@ -334,7 +363,7 @@ def save_trades(t):
 
 def load_copy_trades():
     conn = db_conn()
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT telegram_id, target_wallet, chain, pct_allocation, max_usdt_per_trade, last_tx_hash, last_tx_time, last_tx_block, status FROM copy_trades")
         rows = cur.fetchall()
     copy_trades = {}
@@ -463,6 +492,14 @@ def get_bsc_address(user_row):
         bsc_addr = next((a.get("address") for a in addr_list if (a.get("address") or "").startswith("0x")), None)
     return bsc_addr
 
+def clear_user_session_keys(users, uid, keys):
+    u = users.get(uid)
+    if not isinstance(u, dict):
+        return
+    for k in keys:
+        if k in u:
+            del u[k]
+
 async def show_main_menu(message, uid, edit=False, username=None):
     auto_link_wallet(str(uid), username=username)
     users = load_users()
@@ -496,6 +533,7 @@ async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         users = load_users()
         if str(uid) in users and "state" in users[str(uid)]:
             users[str(uid)]["state"] = None
+            clear_user_session_keys(users, str(uid), ["auto_trade", "copy_trade", "withdraw_address"])
             save_users(users)
         await show_main_menu(query.message, uid, edit=True, username=u.effective_user.username)
     elif data == "cb_register":
@@ -592,6 +630,9 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             amount = float(text)
             # Placeholder for actual withdraw logic
             await u.message.reply_text(f"✅ Withdrawal of {amount} USDT to `{users[uid]['withdraw_address']}` initiated! (Mock)", reply_markup=rm, parse_mode="Markdown")
+            users = load_users()
+            clear_user_session_keys(users, uid, ["withdraw_address"])
+            save_users(users)
         except ValueError:
             await u.message.reply_text("Invalid amount. Please try again from the menu.", reply_markup=rm)
             
@@ -608,6 +649,9 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             def __init__(self, args):
                 self.args = args
         await cmd_trade(u, MockCtx(parts), is_callback=False)
+        users = load_users()
+        clear_user_session_keys(users, uid, ["auto_trade", "copy_trade"])
+        save_users(users)
 
     elif state == "awaiting_auto_trade_amount":
         try:
@@ -714,6 +758,9 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"The bot will automatically sell if limits are hit.", 
                 reply_markup=rm, parse_mode="Markdown"
             )
+            users = load_users()
+            clear_user_session_keys(users, uid, ["auto_trade"])
+            save_users(users)
             
         except ValueError:
             await u.message.reply_text("Invalid percentage. Please try again.", reply_markup=rm)
@@ -761,6 +808,9 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"The bot will automatically mirror new swaps.",
                 reply_markup=rm, parse_mode="Markdown"
             )
+            users = load_users()
+            clear_user_session_keys(users, uid, ["copy_trade"])
+            save_users(users)
         except ValueError:
             await u.message.reply_text("Invalid amount. Enter a positive number.", reply_markup=rm)
 
@@ -804,14 +854,25 @@ async def monitor_tp_sl(app: Application):
                     elif curr_price <= sl_target: hit_type = "Stop-Loss"
                     
                     if hit_type:
-                        # 1. Fetch current token balance
-                        r = proxy_get("/v1/thirdParty/tx/getSwapOrder", {"chain": chain, "assetsId": aid, "pageSize": "50", "pageNO": "0"})
                         bal = 0.0
-                        if r.get("status") in (200, 0) and r.get("data"):
-                            for o in r["data"]:
-                                if o.get("status") != "confirmed": continue
-                                if o.get("outTokenAddress") == ta: bal += float(o.get("outAmount", "0")) / 1e18
-                                elif o.get("inTokenAddress") == ta: bal -= float(o.get("inAmount", "0")) / 1e18
+                        decimals = 18
+                        bsc_addr = get_bsc_address(users.get(uid, {}))
+                        if bsc_addr:
+                            tr = proxy_get("/address/walletinfo/tokens", {
+                                "wallet_address": bsc_addr,
+                                "chain": chain,
+                                "sort": "balance_usd",
+                                "sort_dir": "desc",
+                                "pageSize": "200"
+                            })
+                            if tr.get("status") == 1 and tr.get("data"):
+                                for tok in tr["data"]:
+                                    tok_addr = (tok.get("token") or "").split("-")[0].lower()
+                                    if tok_addr == ta.lower():
+                                        bal = float(tok.get("balance_amount", 0) or 0)
+                                        decimals = int(tok.get("decimals") or tok.get("token_decimals") or 18)
+                                        db_upsert_token_meta(chain, ta, symbol=sym, decimals=decimals)
+                                        break
                         
                         if bal <= 0.0001:
                             # User already sold manually
@@ -820,8 +881,8 @@ async def monitor_tp_sl(app: Application):
                             continue
                             
                         # 2. Execute SELL order
-                        in_amount_wei = str(int(bal * 1e18)) # Assuming 18 decimals, proxy_post will handle exact if needed but we send max wei
-                        qr = send_swap_order(uid, chain, aid, ta, usdt_addr, in_amount_wei, "sell", slippage="1500", context={"source": "tpsl"})
+                        in_amount_smallest = str(int(bal * (10 ** decimals)))
+                        qr = send_swap_order(uid, chain, aid, ta, usdt_addr, in_amount_smallest, "sell", slippage="1500", context={"source": "tpsl"})
                         
                         if qr.get("status") in (200, 0):
                             # Sell successful
@@ -943,28 +1004,32 @@ async def monitor_copy_trades(app: Application):
                         else:  # sell
                             # For sell, look up token balance from on-chain wallet tokens
                             bal = 0.0
+                            decimals = 18
                             try:
                                 if bsc_addr:
                                     bal_r = proxy_get("/address/walletinfo/tokens", {"wallet_address": bsc_addr, "chain": chain, "pageSize": 50})
                                 else:
                                     bal_r = {}
                                 for tok in bal_r.get("data", []):
-                                    if tok.get("token", "").lower() == tx_token_addr.lower():
+                                    tok_addr = (tok.get("token") or "").split("-")[0].lower()
+                                    if tok_addr == tx_token_addr.lower():
                                         bal = float(tok.get("balance_amount", 0) or 0)
+                                        decimals = int(tok.get("decimals") or tok.get("token_decimals") or 18)
+                                        db_upsert_token_meta(chain, tx_token_addr, symbol=token_sym, decimals=decimals)
                                         break
                             except Exception:
                                 pass
                                     
                             if bal > 0.0001:
-                                in_amount_wei = str(int(bal * 1e18))
-                                qr = send_swap_order(uid, chain, aid, tx_token_addr, usdt_addr, in_amount_wei, "sell", slippage="1500", context={"source": "copy_trade", "target": target_addr})
+                                in_amount_smallest = str(int(bal * (10 ** decimals)))
+                                qr = send_swap_order(uid, chain, aid, tx_token_addr, usdt_addr, in_amount_smallest, "sell", slippage="1500", context={"source": "copy_trade", "target": target_addr})
                                 
                                 if qr.get("status") in (200, 0):
                                     msg = f"👥 **Copied Sell**\nTarget: `{target_addr[:10]}...`\nSold: {round(bal, 4)} {token_sym}"
                                     await app.bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
                                 else:
                                     err_msg = qr.get('msg', 'Unknown Error')
-                                    kb = [[InlineKeyboardButton("🔄 Retry Sell", callback_data=f"retry_{chain}_{aid}_{tx_token_addr}_{usdt_addr}_{in_amount_wei}_sell"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
+                                    kb = [[InlineKeyboardButton("🔄 Retry Sell", callback_data=f"retry_{chain}_{aid}_{tx_token_addr}_{usdt_addr}_{in_amount_smallest}_sell"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
                                     await app.bot.send_message(chat_id=uid, text=f"❌ **Copy Trade Failed (Sell {token_sym})**\nReason: {err_msg}", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
                                     
                     except Exception as inner_e:
