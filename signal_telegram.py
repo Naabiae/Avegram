@@ -74,7 +74,148 @@ def db_init():
                 PRIMARY KEY (telegram_id, target_wallet, chain)
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signal_history (
+                symbol TEXT,
+                signal_type TEXT,
+                confidence NUMERIC,
+                entry_price NUMERIC,
+                status TEXT,
+                pnl_pct NUMERIC,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                expiry_time BIGINT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS swap_orders (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id TEXT,
+                order_id TEXT,
+                chain TEXT,
+                in_token TEXT,
+                out_token TEXT,
+                in_amount TEXT,
+                swap_type TEXT,
+                status TEXT,
+                ave_status TEXT,
+                ave_msg TEXT,
+                context JSONB,
+                raw_response JSONB,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_errors (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id TEXT,
+                area TEXT,
+                message TEXT,
+                context JSONB,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS task_heartbeats (
+                task_name TEXT PRIMARY KEY,
+                last_ok_at TIMESTAMPTZ,
+                last_error_at TIMESTAMPTZ,
+                error_count BIGINT DEFAULT 0,
+                last_error TEXT,
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+        cur.execute("ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS last_tx_time BIGINT")
+        cur.execute("ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS last_tx_block BIGINT")
     conn.commit()
+
+def db_log_error(area, message, telegram_id=None, context=None):
+    try:
+        conn = db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_errors (telegram_id, area, message, context) VALUES (%s, %s, %s, %s::jsonb)",
+                (str(telegram_id) if telegram_id is not None else None, area, str(message), json.dumps(context or {})),
+            )
+        conn.commit()
+    except Exception:
+        pass
+
+def db_heartbeat_ok(task_name):
+    conn = db_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO task_heartbeats (task_name, last_ok_at, updated_at)
+            VALUES (%s, now(), now())
+            ON CONFLICT (task_name) DO UPDATE SET
+                last_ok_at = now(),
+                updated_at = now()
+            """,
+            (task_name,),
+        )
+    conn.commit()
+
+def db_heartbeat_error(task_name, err):
+    conn = db_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO task_heartbeats (task_name, last_error_at, error_count, last_error, updated_at)
+            VALUES (%s, now(), 1, %s, now())
+            ON CONFLICT (task_name) DO UPDATE SET
+                last_error_at = now(),
+                error_count = task_heartbeats.error_count + 1,
+                last_error = EXCLUDED.last_error,
+                updated_at = now()
+            """,
+            (task_name, str(err)),
+        )
+    conn.commit()
+
+def db_insert_signal_history(rows):
+    conn = db_conn()
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO signal_history (symbol, signal_type, confidence, entry_price, status, pnl_pct, expiry_time) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            rows,
+        )
+    conn.commit()
+
+def db_insert_swap_order(telegram_id, chain, in_token, out_token, in_amount, swap_type, resp, context=None):
+    try:
+        status = None
+        ave_status = resp.get("status")
+        ave_msg = resp.get("msg")
+        data = resp.get("data", {})
+        order_id = None
+        if isinstance(data, dict):
+            order_id = data.get("id") or data.get("orderId")
+            status = data.get("status")
+        conn = db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO swap_orders (telegram_id, order_id, chain, in_token, out_token, in_amount, swap_type, status, ave_status, ave_msg, context, raw_response)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                """,
+                (
+                    str(telegram_id),
+                    order_id,
+                    chain,
+                    in_token,
+                    out_token,
+                    str(in_amount),
+                    swap_type,
+                    status,
+                    str(ave_status) if ave_status is not None else None,
+                    str(ave_msg) if ave_msg is not None else None,
+                    json.dumps(context or {}),
+                    json.dumps(resp),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        pass
 
 _USER_RESERVED_KEYS = {"username", "chain", "assets_id", "address_list", "state"}
 
@@ -153,7 +294,14 @@ def save_trades(t):
     conn = db_conn()
     with conn.cursor() as cur:
         for uid, items in t.items():
-            cur.execute("DELETE FROM trades WHERE telegram_id = %s", (str(uid),))
+            cur.execute("SELECT token_address, chain FROM trades WHERE telegram_id = %s", (str(uid),))
+            existing = {(r[0], r[1]) for r in cur.fetchall()}
+            incoming = {(token_address, (d.get("chain") or "bsc")) for token_address, d in (items or {}).items()}
+            for token_address, chain in existing - incoming:
+                cur.execute(
+                    "DELETE FROM trades WHERE telegram_id = %s AND token_address = %s AND chain = %s",
+                    (str(uid), token_address, chain),
+                )
             if not items:
                 continue
             for token_address, d in items.items():
@@ -187,7 +335,7 @@ def save_trades(t):
 def load_copy_trades():
     conn = db_conn()
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT telegram_id, target_wallet, chain, pct_allocation, max_usdt_per_trade, last_tx_hash, status FROM copy_trades")
+        cur.execute("SELECT telegram_id, target_wallet, chain, pct_allocation, max_usdt_per_trade, last_tx_hash, last_tx_time, last_tx_block, status FROM copy_trades")
         rows = cur.fetchall()
     copy_trades = {}
     for r in rows:
@@ -198,6 +346,8 @@ def load_copy_trades():
             "pct_allocation": float(r["pct_allocation"]) if r.get("pct_allocation") is not None else 0.0,
             "max_usdt_per_trade": float(r["max_usdt_per_trade"]) if r.get("max_usdt_per_trade") is not None else 0.0,
             "last_tx_hash": r.get("last_tx_hash") or "",
+            "last_tx_time": int(r["last_tx_time"]) if r.get("last_tx_time") is not None else 0,
+            "last_tx_block": int(r["last_tx_block"]) if r.get("last_tx_block") is not None else 0,
             "status": r.get("status") or "active",
         }
     return copy_trades
@@ -206,18 +356,27 @@ def save_copy_trades(t):
     conn = db_conn()
     with conn.cursor() as cur:
         for uid, items in t.items():
-            cur.execute("DELETE FROM copy_trades WHERE telegram_id = %s", (str(uid),))
+            cur.execute("SELECT target_wallet, chain FROM copy_trades WHERE telegram_id = %s", (str(uid),))
+            existing = {(r[0], r[1]) for r in cur.fetchall()}
+            incoming = {(target_wallet, (d.get("chain") or "bsc")) for target_wallet, d in (items or {}).items()}
+            for target_wallet, chain in existing - incoming:
+                cur.execute(
+                    "DELETE FROM copy_trades WHERE telegram_id = %s AND target_wallet = %s AND chain = %s",
+                    (str(uid), target_wallet, chain),
+                )
             if not items:
                 continue
             for target_wallet, d in items.items():
                 cur.execute(
                     """
-                    INSERT INTO copy_trades (telegram_id, target_wallet, chain, pct_allocation, max_usdt_per_trade, last_tx_hash, status, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                    INSERT INTO copy_trades (telegram_id, target_wallet, chain, pct_allocation, max_usdt_per_trade, last_tx_hash, last_tx_time, last_tx_block, status, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
                     ON CONFLICT (telegram_id, target_wallet, chain) DO UPDATE SET
                         pct_allocation = EXCLUDED.pct_allocation,
                         max_usdt_per_trade = EXCLUDED.max_usdt_per_trade,
                         last_tx_hash = EXCLUDED.last_tx_hash,
+                        last_tx_time = EXCLUDED.last_tx_time,
+                        last_tx_block = EXCLUDED.last_tx_block,
                         status = EXCLUDED.status,
                         updated_at = now()
                     """,
@@ -228,6 +387,8 @@ def save_copy_trades(t):
                         d.get("pct_allocation") or 0,
                         d.get("max_usdt_per_trade") or 0,
                         d.get("last_tx_hash") or "",
+                        d.get("last_tx_time") or 0,
+                        d.get("last_tx_block") or 0,
                         d.get("status") or "active",
                     ),
                 )
@@ -254,6 +415,26 @@ def proxy_post(path, body):
     req = urllib.request.Request("https://bot-api.ave.ai" + path, data=data, headers=proxy_headers("POST", path, body))
     with urllib.request.urlopen(req, timeout=15) as r: return json.loads(r.read())
 
+def send_swap_order(telegram_id, chain, assets_id, in_token, out_token, in_amount, swap_type, slippage="1500", context=None):
+    payload = {
+        "chain": chain,
+        "assetsId": assets_id,
+        "inTokenAddress": in_token,
+        "outTokenAddress": out_token,
+        "inAmount": str(in_amount),
+        "swapType": swap_type,
+        "slippage": str(slippage),
+    }
+    try:
+        resp = proxy_post("/v1/thirdParty/tx/sendSwapOrder", payload)
+    except Exception as e:
+        db_log_error("sendSwapOrder_exception", e, telegram_id=telegram_id, context={"payload": payload, "context": context or {}})
+        raise
+    db_insert_swap_order(telegram_id, chain, in_token, out_token, in_amount, swap_type, resp, context=context)
+    if resp.get("status") not in (200, 0):
+        db_log_error("sendSwapOrder_failed", resp.get("msg", "Unknown Error"), telegram_id=telegram_id, context={"payload": payload, "resp": resp, "context": context or {}})
+    return resp
+
 def auto_link_wallet(uid_str, username=None):
     users = load_users()
     if uid_str in users and users[uid_str].get("assets_id"):
@@ -274,6 +455,13 @@ def auto_link_wallet(uid_str, username=None):
             return True
 
     return False
+
+def get_bsc_address(user_row):
+    addr_list = user_row.get("address_list", []) or []
+    bsc_addr = next((a.get("address") for a in addr_list if a.get("chain") == "bsc" and (a.get("address") or "").startswith("0x")), None)
+    if not bsc_addr and addr_list:
+        bsc_addr = next((a.get("address") for a in addr_list if (a.get("address") or "").startswith("0x")), None)
+    return bsc_addr
 
 async def show_main_menu(message, uid, edit=False, username=None):
     auto_link_wallet(str(uid), username=username)
@@ -345,10 +533,7 @@ async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(parts) >= 7:
             _, chain, aid, in_token, out_token, in_amount, swap_type = parts
             await query.message.edit_text("🔄 Retrying trade...", reply_markup=None)
-            qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {
-                "chain": chain, "assetsId": aid, "inTokenAddress": in_token, "outTokenAddress": out_token, 
-                "inAmount": in_amount, "swapType": swap_type, "slippage": "1500"
-            })
+            qr = send_swap_order(uid, chain, aid, in_token, out_token, in_amount, swap_type, slippage="1500", context={"source": "retry"})
             if qr.get("status") in (200, 0):
                 oid = qr.get('data', {}).get('id', '')
                 await query.message.edit_text(f"✅ **Retry Successful!**\nOrder ID: `{oid}`", parse_mode="Markdown")
@@ -485,7 +670,7 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             aid = users[uid]["assets_id"]
             usdt = "0x55d398326f99059fF775485246999027B3197955"
             
-            qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {"chain": chain, "assetsId": aid, "inTokenAddress": usdt, "outTokenAddress": ta, "inAmount": str(int(amount * 1e18)), "slippage": "1000"})
+            qr = send_swap_order(uid, chain, aid, usdt, ta, int(amount * 1e18), "buy", slippage="1000", context={"source": "auto_trade"})
             
             if qr.get("status") not in (200, 0):
                 err_msg = qr.get('msg', 'Unknown Error')
@@ -636,10 +821,7 @@ async def monitor_tp_sl(app: Application):
                             
                         # 2. Execute SELL order
                         in_amount_wei = str(int(bal * 1e18)) # Assuming 18 decimals, proxy_post will handle exact if needed but we send max wei
-                        qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {
-                            "chain": chain, "assetsId": aid, "inTokenAddress": ta, "outTokenAddress": usdt_addr, 
-                            "inAmount": in_amount_wei, "slippage": "1500"
-                        })
+                        qr = send_swap_order(uid, chain, aid, ta, usdt_addr, in_amount_wei, "sell", slippage="1500", context={"source": "tpsl"})
                         
                         if qr.get("status") in (200, 0):
                             # Sell successful
@@ -651,13 +833,18 @@ async def monitor_tp_sl(app: Application):
                             changed = True
                         else:
                             # Failed to sell
-                            print(f"TP/SL Sell failed for {uid} {sym}: {qr}")
+                            db_log_error("tpsl_sell_failed", qr.get("msg", "sell failed"), telegram_id=uid, context={"resp": qr, "token": ta, "symbol": sym, "chain": chain})
                             
             if changed:
                 save_trades(trades)
+            db_heartbeat_ok("monitor_tp_sl")
                 
         except Exception as e:
-            print(f"TP/SL Monitor error: {e}")
+            db_log_error("tpsl_monitor_error", e)
+            try:
+                db_heartbeat_error("monitor_tp_sl", e)
+            except Exception:
+                pass
             
         await asyncio.sleep(30)
 
@@ -676,6 +863,7 @@ async def monitor_copy_trades(app: Application):
             for uid, targets in list(copy_trades.items()):
                 if uid not in users or not users[uid].get("assets_id"): continue
                 aid = users[uid]["assets_id"]
+                bsc_addr = get_bsc_address(users[uid])
                 
                 for target_addr, cfg in list(targets.items()):
                     if cfg.get("status") != "active": continue
@@ -697,18 +885,27 @@ async def monitor_copy_trades(app: Application):
                     
                     latest_tx = txs[0]
                     tx_hash = latest_tx.get("transaction", "")
+                    tx_time = int(latest_tx.get("time") or latest_tx.get("timestamp") or 0)
+                    tx_block = int(latest_tx.get("block") or latest_tx.get("block_number") or 0)
                     
                     # If this is the first poll, just set the hash and continue
                     if not cfg.get("last_tx_hash"):
                         cfg["last_tx_hash"] = tx_hash
+                        cfg["last_tx_time"] = tx_time
+                        cfg["last_tx_block"] = tx_block
                         changed = True
                         continue
                         
                     # If we have seen this hash, nothing new
-                    if tx_hash == cfg["last_tx_hash"]: continue
+                    if tx_hash and tx_hash == cfg.get("last_tx_hash"):
+                        continue
+                    if (not tx_hash) and tx_time and tx_time <= int(cfg.get("last_tx_time") or 0) and tx_block and tx_block <= int(cfg.get("last_tx_block") or 0):
+                        continue
                     
                     # New transaction found! Parse it
                     cfg["last_tx_hash"] = tx_hash
+                    cfg["last_tx_time"] = tx_time
+                    cfg["last_tx_block"] = tx_block
                     changed = True
                     
                     # Determine swap direction from tx fields
@@ -733,10 +930,7 @@ async def monitor_copy_trades(app: Application):
                         
                         if tx_type == "buy":
                             in_amount_wei = str(int(trade_amount * 1e18))
-                            qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {
-                                "chain": chain, "assetsId": aid, "inTokenAddress": usdt_addr, "outTokenAddress": tx_token_addr, 
-                                "inAmount": in_amount_wei, "slippage": "1500"
-                            })
+                            qr = send_swap_order(uid, chain, aid, usdt_addr, tx_token_addr, in_amount_wei, "buy", slippage="1500", context={"source": "copy_trade", "target": target_addr})
                             
                             if qr.get("status") in (200, 0):
                                 msg = f"👥 **Copied Buy**\nTarget: `{target_addr[:10]}...`\nBought: ~${trade_amount} of {token_sym}\nOrder: `{qr.get('data', {}).get('id', '')}`"
@@ -750,7 +944,10 @@ async def monitor_copy_trades(app: Application):
                             # For sell, look up token balance from on-chain wallet tokens
                             bal = 0.0
                             try:
-                                bal_r = proxy_get("/address/walletinfo/tokens", {"wallet_address": bsc_addr, "chain": chain, "pageSize": 50})
+                                if bsc_addr:
+                                    bal_r = proxy_get("/address/walletinfo/tokens", {"wallet_address": bsc_addr, "chain": chain, "pageSize": 50})
+                                else:
+                                    bal_r = {}
                                 for tok in bal_r.get("data", []):
                                     if tok.get("token", "").lower() == tx_token_addr.lower():
                                         bal = float(tok.get("balance_amount", 0) or 0)
@@ -760,10 +957,7 @@ async def monitor_copy_trades(app: Application):
                                     
                             if bal > 0.0001:
                                 in_amount_wei = str(int(bal * 1e18))
-                                qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {
-                                    "chain": chain, "assetsId": aid, "inTokenAddress": tx_token_addr, "outTokenAddress": usdt_addr, 
-                                    "inAmount": in_amount_wei, "slippage": "1500"
-                                })
+                                qr = send_swap_order(uid, chain, aid, tx_token_addr, usdt_addr, in_amount_wei, "sell", slippage="1500", context={"source": "copy_trade", "target": target_addr})
                                 
                                 if qr.get("status") in (200, 0):
                                     msg = f"👥 **Copied Sell**\nTarget: `{target_addr[:10]}...`\nSold: {round(bal, 4)} {token_sym}"
@@ -774,13 +968,18 @@ async def monitor_copy_trades(app: Application):
                                     await app.bot.send_message(chat_id=uid, text=f"❌ **Copy Trade Failed (Sell {token_sym})**\nReason: {err_msg}", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
                                     
                     except Exception as inner_e:
-                        print(f"Inner copy trade error for {uid}: {inner_e}")
+                        db_log_error("copy_trade_inner_error", inner_e, telegram_id=uid, context={"target": target_addr, "chain": chain})
                         
             if changed:
                 save_copy_trades(copy_trades)
+            db_heartbeat_ok("monitor_copy_trades")
                 
         except Exception as e:
-            print(f"Copy Trade Monitor error: {e}")
+            db_log_error("copy_trade_monitor_error", e)
+            try:
+                db_heartbeat_error("monitor_copy_trades", e)
+            except Exception:
+                pass
             
         await asyncio.sleep(60)
 
@@ -985,6 +1184,22 @@ async def cmd_signal(u, ctx, is_callback=False):
     if not signals:
         await msg.edit_text("No signals above 60% confidence right now. Try again later.", reply_markup=rm)
         return
+
+    try:
+        expiry_time = int((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)).timestamp())
+        rows = []
+        for s in signals[:25]:
+            if s["chg"] < -3:
+                signal_type = "buy"
+            elif s["chg"] > 5:
+                signal_type = "sell"
+            else:
+                signal_type = "watch"
+            rows.append((s["sym"], signal_type, float(s["conf"]), float(s["price"]), "active", None, expiry_time))
+        db_insert_signal_history(rows)
+    except Exception as e:
+        db_log_error("signal_history_insert", e, telegram_id=u.effective_user.id if u and u.effective_user else None, context={"count": len(signals)})
+
     lines = [f"🔔 {len(signals)} Signals Found (≥60% confidence)\n"]
     buttons = []
     for s in signals[:8]:
@@ -1041,7 +1256,7 @@ async def cmd_trade(u, ctx, is_callback=False):
     usdt = "0x55d398326f99059fF775485246999027B3197955"
     await msg.edit_text("Getting quote for " + str(amount) + " USDT to " + sym + "...")
     
-    qr = proxy_post("/v1/thirdParty/tx/sendSwapOrder", {"chain": "bsc", "assetsId": aid, "inTokenAddress": usdt, "outTokenAddress": ta, "inAmount": str(int(amount * 1e18)), "slippage": "500"})
+    qr = send_swap_order(uid, "bsc", aid, usdt, ta, int(amount * 1e18), "buy", slippage="500", context={"source": "trade"})
     if qr.get("status") not in (200, 0):
         err_msg = qr.get('msg', 'Unknown Error')
         kb = [[InlineKeyboardButton("🔄 Retry Trade", callback_data=f"retry_bsc_{aid}_{usdt}_{ta}_{int(amount * 1e18)}_buy"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
@@ -1259,4 +1474,9 @@ def main():
     print("Avegram v2 running on proxy wallet mode...")
     app.run_polling()
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("migrate", "--migrate"):
+        db_init()
+        print("db_init ok")
+    else:
+        main()
