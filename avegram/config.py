@@ -2,7 +2,10 @@ import os
 from dotenv import load_dotenv
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-load_dotenv(os.path.join(ROOT_DIR, ".env"))
+# override=True allows a local .env to shadow already-set environment variables,
+# which is useful for development (e.g. pointing at a local DB instead of the
+# remote one that might be unreachable from this machine).
+load_dotenv(os.path.join(ROOT_DIR, ".env"), override=True)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 AVE_API_KEY = os.environ.get("AVE_API_KEY", "")

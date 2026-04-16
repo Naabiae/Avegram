@@ -1,10 +1,11 @@
 import asyncio
+import hashlib
 
 from ave.http import api_get
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from ..db import load_copy_trades, load_users, save_copy_trades, db_log_error, db_heartbeat_ok, db_heartbeat_error, db_upsert_token_meta
+from ..db import load_copy_trades, load_users, save_copy_trades, db_log_error, db_heartbeat_ok, db_heartbeat_error, db_upsert_token_meta, db_save_pending_retry
 from ..proxy import proxy_get, send_swap_order
 from ..utils import get_bsc_address
 
@@ -63,17 +64,33 @@ async def monitor_copy_trades(app):
                     cfg["last_tx_block"] = tx_block
                     changed = True
 
-                    from_addr = latest_tx.get("from_address", "")
+                    # Determine swap direction from the Ave transaction structure.
+                    # Ave returns: from_symbol/from_address (token spent) → to_symbol/to_address (token received).
+                    # A BUY means the wallet spent a stablecoin/BNB and received a non-stable token.
+                    # A SELL means the wallet spent a non-stable token and received a stablecoin/BNB.
+                    STABLE_ADDRS = {
+                        usdt_addr.lower(),
+                        "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+                        "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD
+                        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC
+                    }
+                    from_addr_field = (latest_tx.get("from_address") or "").lower()
+                    to_addr_field = (latest_tx.get("to_address") or "").lower()
                     to_sym = latest_tx.get("to_symbol", "")
                     from_sym = latest_tx.get("from_symbol", "")
-                    from_amount = latest_tx.get("from_amount", 0)
-                    tx_token_addr = latest_tx.get("to_address", "") if float(from_amount or 0) > 0 else latest_tx.get("from_address", "")
 
-                    is_buy = from_addr.lower() == "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
+                    # is_buy: wallet spent a stable and received a non-stable
+                    is_buy = from_addr_field in STABLE_ADDRS and to_addr_field not in STABLE_ADDRS
+                    is_sell = to_addr_field in STABLE_ADDRS and from_addr_field not in STABLE_ADDRS
+                    if not is_buy and not is_sell:
+                        # Can't determine direction – skip
+                        continue
+
                     tx_type = "buy" if is_buy else "sell"
                     token_sym = to_sym if is_buy else from_sym
+                    tx_token_addr = to_addr_field if is_buy else from_addr_field
 
-                    if not tx_token_addr or tx_token_addr in ("0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", usdt_addr):
+                    if not tx_token_addr or tx_token_addr in STABLE_ADDRS:
                         continue
 
                     try:
@@ -88,8 +105,10 @@ async def monitor_copy_trades(app):
                                 await app.bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
                             else:
                                 err_msg = qr.get('msg', 'Unknown Error')
+                                rkey = hashlib.md5(f"{uid}{chain}{usdt_addr}{tx_token_addr}{in_amount_wei}buy".encode()).hexdigest()[:10]
+                                db_save_pending_retry(rkey, uid, chain, aid, usdt_addr, tx_token_addr, in_amount_wei, "buy")
                                 kb = [[
-                                    InlineKeyboardButton("🔄 Retry Buy", callback_data=f"retry_{chain}_{aid}_{usdt_addr}_{tx_token_addr}_{in_amount_wei}_buy"),
+                                    InlineKeyboardButton("🔄 Retry Buy", callback_data=f"retry_{rkey}"),
                                     InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")
                                 ]]
                                 await app.bot.send_message(chat_id=uid, text=f"❌ **Copy Trade Failed (Buy {token_sym})**\nReason: {err_msg}", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
@@ -121,8 +140,10 @@ async def monitor_copy_trades(app):
                                     await app.bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
                                 else:
                                     err_msg = qr.get('msg', 'Unknown Error')
+                                    rkey = hashlib.md5(f"{uid}{chain}{tx_token_addr}{usdt_addr}{in_amount_smallest}sell".encode()).hexdigest()[:10]
+                                    db_save_pending_retry(rkey, uid, chain, aid, tx_token_addr, usdt_addr, in_amount_smallest, "sell")
                                     kb = [[
-                                        InlineKeyboardButton("🔄 Retry Sell", callback_data=f"retry_{chain}_{aid}_{tx_token_addr}_{usdt_addr}_{in_amount_smallest}_sell"),
+                                        InlineKeyboardButton("🔄 Retry Sell", callback_data=f"retry_{rkey}"),
                                         InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")
                                     ]]
                                     await app.bot.send_message(chat_id=uid, text=f"❌ **Copy Trade Failed (Sell {token_sym})**\nReason: {err_msg}", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
