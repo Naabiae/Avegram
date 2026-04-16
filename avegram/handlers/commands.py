@@ -7,6 +7,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ave.http import api_get
 
+from ..config import AVE_API_KEY
 from ..db import (
     load_users,
     save_users,
@@ -16,6 +17,7 @@ from ..db import (
     save_copy_trades,
     db_insert_signal_history,
     db_log_error,
+    db_save_pending_retry,
 )
 from ..proxy import proxy_get, proxy_post, send_swap_order
 from ..utils import get_bsc_address, clear_user_session_keys
@@ -175,11 +177,12 @@ async def cmd_signal(u, ctx, is_callback=False):
 
     tokens = []
     seen = set()
+    loop = asyncio.get_running_loop()
     try:
         for chain in ["bsc", "solana"]:
             url = f"https://data.ave-api.xyz/v2/signals/public/list?chain={chain}&pageSize=20&pageNO=1"
-            req = urllib.request.Request(url, headers={"X-API-KEY": ""})
-            r = await asyncio.get_event_loop().run_in_executor(None, lambda u=url: urllib.request.urlopen(req, timeout=10))
+            req = urllib.request.Request(url, headers={"X-API-KEY": AVE_API_KEY})
+            r = await loop.run_in_executor(None, lambda req=req: urllib.request.urlopen(req, timeout=10))
             d = json.loads(r.read())
             for s in d.get("data", []):
                 ta = s.get("token", "")
@@ -194,8 +197,8 @@ async def cmd_signal(u, ctx, is_callback=False):
     for kw in ["PEPE", "SHIB", "DOGE", "BNB", "CAKE", "WBNB", "BTCB", "ETH", "SOL", "XRP"]:
         try:
             url = f"https://data.ave-api.xyz/v2/tokens?keyword={kw}&limit=3&chain=bsc"
-            req = urllib.request.Request(url, headers={"X-API-KEY": ""})
-            r = await asyncio.get_event_loop().run_in_executor(None, lambda u=url: urllib.request.urlopen(req, timeout=10))
+            req = urllib.request.Request(url, headers={"X-API-KEY": AVE_API_KEY})
+            r = await loop.run_in_executor(None, lambda req=req: urllib.request.urlopen(req, timeout=10))
             d = json.loads(r.read())
             for t in d.get("data", []):
                 a = (t.get("token") or "").split("-")[0]
@@ -217,9 +220,9 @@ async def cmd_signal(u, ctx, is_callback=False):
             tid = f"{ta}-{chain_tok}"
             url1 = f"https://data.ave-api.xyz/v2/tokens/{tid}"
             url2 = f"https://data.ave-api.xyz/v2/contracts/{tid}"
-            r1 = await asyncio.get_event_loop().run_in_executor(None, lambda u=url1: urllib.request.urlopen(urllib.request.Request(u, headers={"X-API-KEY": ""}), timeout=10))
+            r1 = await loop.run_in_executor(None, lambda u=url1: urllib.request.urlopen(urllib.request.Request(u, headers={"X-API-KEY": AVE_API_KEY}), timeout=10))
             d1 = json.loads(r1.read())
-            r2 = await asyncio.get_event_loop().run_in_executor(None, lambda u=url2: urllib.request.urlopen(urllib.request.Request(u, headers={"X-API-KEY": ""}), timeout=10))
+            r2 = await loop.run_in_executor(None, lambda u=url2: urllib.request.urlopen(urllib.request.Request(u, headers={"X-API-KEY": AVE_API_KEY}), timeout=10))
             d2 = json.loads(r2.read())
             pd = d1.get("data", {}).get("token", {})
             rd = d2.get("data", {})
@@ -323,7 +326,10 @@ async def cmd_trade(u, ctx, is_callback=False):
     qr = send_swap_order(uid, "bsc", aid, usdt, ta, int(amount * 1e18), "buy", slippage="500", context={"source": "trade"})
     if qr.get("status") not in (200, 0):
         err_msg = qr.get('msg', 'Unknown Error')
-        kb = [[InlineKeyboardButton("🔄 Retry Trade", callback_data=f"retry_bsc_{aid}_{usdt}_{ta}_{int(amount * 1e18)}_buy"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
+        import hashlib as _hl
+        rkey = _hl.md5(f"{uid}bsc{usdt}{ta}{int(amount * 1e18)}buy".encode()).hexdigest()[:10]
+        db_save_pending_retry(rkey, uid, "bsc", aid, usdt, ta, int(amount * 1e18), "buy")
+        kb = [[InlineKeyboardButton("🔄 Retry Trade", callback_data=f"retry_{rkey}"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
         await msg.edit_text(f"❌ **Swap Failed**\nReason: {err_msg}", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
 
@@ -394,7 +400,7 @@ async def cmd_track(u, ctx, is_callback=False):
             bal = float(t.get("balance_amount", 0) or 0)
             if bal <= 0:
                 continue
-            lines.append(t.get("symbol", "?") + ": " + str(round(bal, 4)) + " | P/L: " + str(round(float(t.get("profit_pct", 0), 1))) + "%")
+            lines.append(t.get("symbol", "?") + ": " + str(round(bal, 4)) + " | P/L: " + str(round(float(t.get("profit_pct", 0)), 1)) + "%")
     else:
         lines.append("No holdings found")
 

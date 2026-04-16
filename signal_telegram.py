@@ -8,7 +8,7 @@ if not os.path.exists(AVENUE_SCRIPTS):
     AVENUE_SCRIPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ave-cloud-skill", "scripts")
 sys.path.insert(0, AVENUE_SCRIPTS)
 
-from avegram.config import BOT_TOKEN, AVE_API_KEY
+from avegram.config import BOT_TOKEN, AVE_API_KEY, AVE_SECRET_KEY, API_PLAN
 from avegram.db import (
     db_init,
     load_users,
@@ -20,12 +20,23 @@ from avegram.db import (
     db_log_error,
     db_insert_signal_history,
     db_upsert_token_meta,
+    db_save_pending_retry,
+    db_get_pending_retry,
 )
 from avegram.proxy import proxy_get, proxy_post, send_swap_order
 from avegram.utils import clear_user_session_keys, get_bsc_address
 from avegram.handlers.menu import show_main_menu, auto_link_wallet
 from avegram.monitors.tpsl import monitor_tp_sl as monitor_tp_sl_impl
 from avegram.monitors.copytrade import monitor_copy_trades as monitor_copy_trades_impl
+
+def _make_retry_key(telegram_id, chain, assets_id, in_token, out_token, in_amount, swap_type) -> str:
+    """Store full trade params server-side and return a short callback-safe key (<= 64 bytes)."""
+    import hashlib as _hl
+    raw = f"{telegram_id}{chain}{in_token}{out_token}{in_amount}{swap_type}"
+    key = _hl.md5(raw.encode()).hexdigest()[:10]
+    db_save_pending_retry(key, telegram_id, chain, assets_id, in_token, out_token, in_amount, swap_type)
+    return key  # "retry_<key>" = 17 bytes total, well under 64
+
 
 async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = u.callback_query
@@ -71,11 +82,14 @@ async def handle_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "cb_dismiss":
         await query.message.delete()
     elif data.startswith("retry_"):
-        parts = data.split("_")
-        if len(parts) >= 7:
-            _, chain, aid, in_token, out_token, in_amount, swap_type = parts
+        # data = "retry_<10-char key>" — full params stored server-side to stay under 64-byte limit
+        retry_key = data[len("retry_"):]
+        params = db_get_pending_retry(retry_key)
+        if not params:
+            await query.message.edit_text("❌ Retry data expired. Please start a new trade.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="cb_menu")]]))
+        else:
             await query.message.edit_text("🔄 Retrying trade...", reply_markup=None)
-            qr = send_swap_order(uid, chain, aid, in_token, out_token, in_amount, swap_type, slippage="1500", context={"source": "retry"})
+            qr = send_swap_order(uid, params["chain"], params["assets_id"], params["in_token"], params["out_token"], params["in_amount"], params["swap_type"], slippage="1500", context={"source": "retry"})
             if qr.get("status") in (200, 0):
                 oid = qr.get('data', {}).get('id', '')
                 await query.message.edit_text(f"✅ **Retry Successful!**\nOrder ID: `{oid}`", parse_mode="Markdown")
@@ -160,13 +174,13 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif state == "awaiting_auto_trade_amount":
         try:
             amount = float(text)
-            users[uid]["auto_trade"]["amount"] = amount
-            users[uid]["state"] = "awaiting_auto_trade_tp"
-            save_users(users)
-            # Ensure auto_trade context exists
+            # Guard must come before writing to prevent KeyError
             if "auto_trade" not in users[uid]:
                 await u.message.reply_text("Auto-trade session expired. Please try again from the menu.", reply_markup=rm)
                 return
+            users[uid]["auto_trade"]["amount"] = amount
+            users[uid]["state"] = "awaiting_auto_trade_tp"
+            save_users(users)
             sym = users[uid]["auto_trade"]["sym"]
             await u.message.reply_text(f"Amount: ${amount}\n\nEnter Take-Profit % for {sym} (e.g. 50):", reply_markup=rm)
         except ValueError:
@@ -175,13 +189,12 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif state == "awaiting_auto_trade_tp":
         try:
             tp = float(text)
-            users[uid]["auto_trade"]["tp_pct"] = tp
-            users[uid]["state"] = "awaiting_auto_trade_sl"
-            save_users(users)
-            # Ensure auto_trade context exists
             if "auto_trade" not in users[uid]:
                 await u.message.reply_text("Auto-trade session expired. Please try again from the menu.", reply_markup=rm)
                 return
+            users[uid]["auto_trade"]["tp_pct"] = tp
+            users[uid]["state"] = "awaiting_auto_trade_sl"
+            save_users(users)
             sym = users[uid]["auto_trade"]["sym"]
             await u.message.reply_text(f"Take-Profit: +{tp}%\n\nEnter Stop-Loss % for {sym} (e.g. -20):", reply_markup=rm)
         except ValueError:
@@ -222,7 +235,8 @@ async def handle_text(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
             if qr.get("status") not in (200, 0):
                 err_msg = qr.get('msg', 'Unknown Error')
-                kb = [[InlineKeyboardButton("🔄 Retry Buy", callback_data=f"retry_{chain}_{aid}_{usdt}_{ta}_{int(amount * 1e18)}_buy"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
+                rkey = _make_retry_key(uid, chain, aid, usdt, ta, int(amount * 1e18), "buy")
+                kb = [[InlineKeyboardButton("🔄 Retry Buy", callback_data=f"retry_{rkey}"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
                 await u.message.reply_text(f"❌ **Buy Failed**\nReason: {err_msg}\nTP/SL setup cancelled.", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
                 return
                 
@@ -471,10 +485,11 @@ async def cmd_signal(u, ctx, is_callback=False):
     # 1. Public signals (Ave-filtered, multi-chain)
     try:
         from ave.http import api_get
+        loop = asyncio.get_running_loop()
         for chain in ["bsc", "solana"]:
             url = f"https://data.ave-api.xyz/v2/signals/public/list?chain={chain}&pageSize=20&pageNO=1"
             req = urllib.request.Request(url, headers={"X-API-KEY": AVE_API_KEY})
-            r = await asyncio.get_event_loop().run_in_executor(None, lambda u=url: urllib.request.urlopen(req, timeout=10))
+            r = await loop.run_in_executor(None, lambda req=req: urllib.request.urlopen(req, timeout=10))
             d = json.loads(r.read())
             for s in d.get("data", []):
                 ta = s.get("token", ""); chain_tok = s.get("chain", chain)
@@ -483,11 +498,12 @@ async def cmd_signal(u, ctx, is_callback=False):
                     seen.add(a); tokens.append({"addr": a, "chain": chain_tok, "sym": s.get("symbol", "?"), "name": s.get("name", "")})
     except: pass
     # 2. Trending BSC tokens by keyword
+    loop = asyncio.get_running_loop()
     for kw in ["PEPE", "SHIB", "DOGE", "BNB", "CAKE", "WBNB", "BTCB", "ETH", "SOL", "XRP"]:
         try:
             url = f"https://data.ave-api.xyz/v2/tokens?keyword={kw}&limit=3&chain=bsc"
             req = urllib.request.Request(url, headers={"X-API-KEY": AVE_API_KEY})
-            r = await asyncio.get_event_loop().run_in_executor(None, lambda u=url: urllib.request.urlopen(req, timeout=10))
+            r = await loop.run_in_executor(None, lambda req=req: urllib.request.urlopen(req, timeout=10))
             d = json.loads(r.read())
             for t in d.get("data", []):
                 a = (t.get("token") or "").split("-")[0]
@@ -502,9 +518,9 @@ async def cmd_signal(u, ctx, is_callback=False):
             ta = tok["addr"]; chain_tok = tok["chain"]; tid = f"{ta}-{chain_tok}"
             url1 = f"https://data.ave-api.xyz/v2/tokens/{tid}"
             url2 = f"https://data.ave-api.xyz/v2/contracts/{tid}"
-            r1 = await asyncio.get_event_loop().run_in_executor(None, lambda u=url1: urllib.request.urlopen(urllib.request.Request(u, headers={"X-API-KEY": AVE_API_KEY}), timeout=10))
+            r1 = await loop.run_in_executor(None, lambda u=url1: urllib.request.urlopen(urllib.request.Request(u, headers={"X-API-KEY": AVE_API_KEY}), timeout=10))
             d1 = json.loads(r1.read())
-            r2 = await asyncio.get_event_loop().run_in_executor(None, lambda u=url2: urllib.request.urlopen(urllib.request.Request(u, headers={"X-API-KEY": AVE_API_KEY}), timeout=10))
+            r2 = await loop.run_in_executor(None, lambda u=url2: urllib.request.urlopen(urllib.request.Request(u, headers={"X-API-KEY": AVE_API_KEY}), timeout=10))
             d2 = json.loads(r2.read())
             pd = d1.get("data", {}).get("token", {}); rd = d2.get("data", {})
             price = float(pd.get("current_price_usd") or 0)
@@ -600,7 +616,8 @@ async def cmd_trade(u, ctx, is_callback=False):
     qr = send_swap_order(uid, "bsc", aid, usdt, ta, int(amount * 1e18), "buy", slippage="500", context={"source": "trade"})
     if qr.get("status") not in (200, 0):
         err_msg = qr.get('msg', 'Unknown Error')
-        kb = [[InlineKeyboardButton("🔄 Retry Trade", callback_data=f"retry_bsc_{aid}_{usdt}_{ta}_{int(amount * 1e18)}_buy"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
+        rkey = _make_retry_key(uid, "bsc", aid, usdt, ta, int(amount * 1e18), "buy")
+        kb = [[InlineKeyboardButton("🔄 Retry Trade", callback_data=f"retry_{rkey}"), InlineKeyboardButton("❌ Dismiss", callback_data="cb_dismiss")]]
         await msg.edit_text(f"❌ **Swap Failed**\nReason: {err_msg}", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
         
@@ -663,7 +680,7 @@ async def cmd_track(u, ctx, is_callback=False):
         for t in d["data"][:6]:
             bal = float(t.get("balance_amount", 0) or 0)
             if bal <= 0: continue
-            lines.append(t.get("symbol", "?") + ": " + str(round(bal, 4)) + " | P/L: " + str(round(float(t.get("profit_pct", 0), 1))) + "%")
+            lines.append(t.get("symbol", "?") + ": " + str(round(bal, 4)) + " | P/L: " + str(round(float(t.get("profit_pct", 0)), 1)) + "%")
     else: lines.append("No holdings found")
     
     # Add Copy Trade button
